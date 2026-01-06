@@ -1,0 +1,397 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI股票交易系统</title>
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Lucide Icons CDN -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/lucide/0.263.1/lucide.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/lucide/0.263.1/lucide.min.js"></script>
+    
+    <!-- Tailwind 自定义配置 -->
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        primary: '#3b82f6',
+                        dark: {
+                            950: '#020617',
+                            900: '#0f172a',
+                            800: '#1e293b'
+                        }
+                    },
+                    animation: {
+                        'pulse-slow': 'pulse 3s cubic-bezier(0.4, 0, 0.6, 1) infinite',
+                        'glow': 'glow 2s ease-in-out infinite alternate',
+                        'heartbeat': 'heartbeat 2s infinite'
+                    },
+                    keyframes: {
+                        glow: {
+                            '0%': { 'box-shadow': '0 0 5px rgba(59, 130, 246, 0.5)' },
+                            '100%': { 'box-shadow': '0 0 20px rgba(59, 130, 246, 0.8)' }
+                        },
+                        heartbeat: {
+                            '0%, 100%': { transform: 'scale(1)' },
+                            '14%': { transform: 'scale(1.1)' },
+                            '28%': { transform: 'scale(1)' },
+                            '42%': { transform: 'scale(1.1)' },
+                            '70%': { transform: 'scale(1)' }
+                        }
+                    }
+                }
+            }
+        }
+    </script>
+    
+    <!-- 自定义工具类 -->
+    <style type="text/tailwindcss">
+        @layer utilities {
+            .glass-effect {
+                @apply bg-white/5 backdrop-blur-sm border border-white/10 shadow-lg;
+            }
+            .card-hover {
+                @apply transition-all duration-300 hover:scale-[1.02] hover:shadow-xl;
+            }
+            .text-gradient {
+                @apply bg-clip-text text-transparent bg-gradient-to-r from-blue-400 to-purple-500;
+            }
+            .heartbeat-dot {
+                @apply w-3 h-3 rounded-full bg-green-500 animate-heartbeat;
+            }
+        }
+    </style>
+    
+    <style>
+        body {
+            background-color: #020617;
+            color: #e2e8f0;
+        }
+    </style>
+</head>
+<body class="min-h-screen">
+    <!-- 系统心跳指示灯 -->
+    <div class="fixed top-4 right-4 flex items-center gap-2 z-50">
+        <div class="heartbeat-dot"></div>
+        <span class="text-sm text-gray-300">系统正常</span>
+    </div>
+    
+    <div class="container mx-auto px-4 py-6">
+        <!-- 页面标题 -->
+        <div class="mb-6">
+            <h1 class="text-3xl font-bold text-gradient">AI 股票交易系统</h1>
+            <p class="text-gray-400 mt-1">深夜交易模式</p>
+        </div>
+        
+        <!-- 三栏布局 -->
+        <div class="grid grid-cols-12 gap-6">
+            <!-- 左侧：股票搜索与自选股列表 (20%) -->
+            <div class="col-span-12 md:col-span-3">
+                <!-- 股票搜索 -->
+                <div class="glass-effect rounded-xl p-4 mb-6 card-hover">
+                    <div class="flex items-center gap-2 mb-4">
+                        <i data-lucide="search" class="w-5 h-5 text-blue-400"></i>
+                        <h2 class="text-lg font-semibold">股票搜索</h2>
+                    </div>
+                    <div class="relative">
+                        <input type="text" placeholder="输入股票代码或名称" 
+                               class="w-full bg-white/5 border border-white/10 rounded-lg px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+                        <i data-lucide="search" class="absolute right-3 top-1/2 transform -translate-y-1/2 w-4 h-4 text-gray-400"></i>
+                    </div>
+                </div>
+                
+                <!-- 自选股列表 -->
+                <div class="glass-effect rounded-xl p-4 card-hover">
+                    <div class="flex items-center justify-between mb-4">
+                        <div class="flex items-center gap-2">
+                            <i data-lucide="star" class="w-5 h-5 text-yellow-400"></i>
+                            <h2 class="text-lg font-semibold">自选股</h2>
+                        </div>
+                        <i data-lucide="plus-circle" class="w-5 h-5 text-gray-400 hover:text-blue-400 cursor-pointer"></i>
+                    </div>
+                    
+                    <div class="space-y-3">
+                        <!-- 股票项 -->
+                        <div class="flex justify-between items-center p-3 bg-white/5 rounded-lg hover:bg-white/10 transition-colors">
+                            <div>
+                                <div class="flex items-center gap-2">
+                                    <span class="font-medium">贵州茅台</span>
+                                    <span class="text-xs text-gray-400">600519</span>
+                                </div>
+                                <div class="text-sm mt-1">1789.00</div>
+                            </div>
+                            <div class="text-right">
+                                <div class="text-red-400">-2.34%</div>
+                                <div class="text-xs text-gray-400">-42.80</div>
+                            </div>
+                        </div>
+                        
+                        <div class="flex justify-between items-center p-3 bg-white/5 rounded-lg hover:bg-white/10 transition-colors">
+                            <div>
+                                <div class="flex items-center gap-2">
+                                    <span class="font-medium">宁德时代</span>
+                                    <span class="text-xs text-gray-400">300750</span>
+                                </div>
+                                <div class="text-sm mt-1">186.50</div>
+                            </div>
+                            <div class="text-right">
+                                <div class="text-green-400">+1.89%</div>
+                                <div class="text-xs text-gray-400">+3.45</div>
+                            </div>
+                        </div>
+                        
+                        <div class="flex justify-between items-center p-3 bg-white/5 rounded-lg hover:bg-white/10 transition-colors">
+                            <div>
+                                <div class="flex items-center gap-2">
+                                    <span class="font-medium">腾讯控股</span>
+                                    <span class="text-xs text-gray-400">00700</span>
+                                </div>
+                                <div class="text-sm mt-1">345.80</div>
+                            </div>
+                            <div class="text-right">
+                                <div class="text-green-400">+0.98%</div>
+                                <div class="text-xs text-gray-400">+3.38</div>
+                            </div>
+                        </div>
+                        
+                        <div class="flex justify-between items-center p-3 bg-white/5 rounded-lg hover:bg-white/10 transition-colors">
+                            <div>
+                                <div class="flex items-center gap-2">
+                                    <span class="font-medium">阿里巴巴</span>
+                                    <span class="text-xs text-gray-400">BABA</span>
+                                </div>
+                                <div class="text-sm mt-1">78.90</div>
+                            </div>
+                            <div class="text-right">
+                                <div class="text-red-400">-1.23%</div>
+                                <div class="text-xs text-gray-400">-0.97</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- 中间：核心展示区 (55%) -->
+            <div class="col-span-12 md:col-span-7">
+                <!-- 24小时风险度量仪表盘 -->
+                <div class="glass-effect rounded-xl p-4 mb-6 card-hover">
+                    <div class="flex items-center gap-2 mb-4">
+                        <i data-lucide="activity" class="w-5 h-5 text-red-400"></i>
+                        <h2 class="text-lg font-semibold">24小时风险度量仪表盘</h2>
+                    </div>
+                    
+                    <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
+                        <div class="bg-white/5 rounded-lg p-3">
+                            <div class="text-sm text-gray-400">市场风险</div>
+                            <div class="text-xl font-bold text-yellow-400">中等</div>
+                            <div class="text-xs text-gray-400 mt-1">β系数: 1.23</div>
+                        </div>
+                        
+                        <div class="bg-white/5 rounded-lg p-3">
+                            <div class="text-sm text-gray-400">组合风险</div>
+                            <div class="text-xl font-bold text-green-400">低</div>
+                            <div class="text-xs text-gray-400 mt-1">VaR(95%): -2.1%</div>
+                        </div>
+                        
+                        <div class="bg-white/5 rounded-lg p-3">
+                            <div class="text-sm text-gray-400">流动性风险</div>
+                            <div class="text-xl font-bold text-red-400">高</div>
+                            <div class="text-xs text-gray-400 mt-1">换手率: 18.5%</div>
+                        </div>
+                    </div>
+                    
+                    <!-- 风险趋势图 -->
+                    <div class="bg-white/5 rounded-lg p-3">
+                        <div class="text-sm text-gray-400 mb-2">风险趋势</div>
+                        <div class="h-32 bg-gradient-to-r from-blue-900/30 via-purple-900/30 to-red-900/30 rounded-md flex items-end justify-between px-4">
+                            <div class="w-1/12 h-1/2 bg-blue-400 rounded-t-md"></div>
+                            <div class="w-1/12 h-3/4 bg-blue-500 rounded-t-md"></div>
+                            <div class="w-1/12 h-1/3 bg-blue-400 rounded-t-md"></div>
+                            <div class="w-1/12 h-2/3 bg-purple-400 rounded-t-md"></div>
+                            <div class="w-1/12 h-1/2 bg-purple-500 rounded-t-md"></div>
+                            <div class="w-1/12 h-3/4 bg-purple-600 rounded-t-md"></div>
+                            <div class="w-1/12 h-5/6 bg-red-400 rounded-t-md"></div>
+                            <div class="w-1/12 h-3/4 bg-red-500 rounded-t-md"></div>
+                            <div class="w-1/12 h-2/3 bg-red-600 rounded-t-md"></div>
+                            <div class="w-1/12 h-1/2 bg-red-500 rounded-t-md"></div>
+                            <div class="w-1/12 h-1/3 bg-purple-400 rounded-t-md"></div>
+                            <div class="w-1/12 h-1/4 bg-blue-400 rounded-t-md"></div>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- 技术面 AI 形态识别报告 -->
+                <div class="glass-effect rounded-xl p-4 card-hover">
+                    <div class="flex items-center justify-between mb-4">
+                        <div class="flex items-center gap-2">
+                            <i data-lucide="brain" class="w-5 h-5 text-purple-400"></i>
+                            <h2 class="text-lg font-semibold">技术面 AI 形态识别报告</h2>
+                        </div>
+                        <select class="bg-white/5 border border-white/10 rounded-lg px-3 py-1 text-sm focus:outline-none">
+                            <option>贵州茅台</option>
+                            <option>宁德时代</option>
+                            <option>腾讯控股</option>
+                        </select>
+                    </div>
+                    
+                    <!-- K线图预览 -->
+                    <div class="bg-white/5 rounded-lg p-3 mb-4">
+                        <div class="text-sm text-gray-400 mb-2">K线形态</div>
+                        <div class="h-40 bg-gradient-to-r from-blue-900/20 to-red-900/20 rounded-md flex items-end justify-between px-4">
+                            <div class="w-2/12 h-1/2 bg-green-400 rounded-t-md"></div>
+                            <div class="w-2/12 h-3/4 bg-green-500 rounded-t-md"></div>
+                            <div class="w-2/12 h-1/3 bg-red-400 rounded-b-md"></div>
+                            <div class="w-2/12 h-2/3 bg-red-500 rounded-b-md"></div>
+                            <div class="w-2/12 h-1/2 bg-green-400 rounded-t-md"></div>
+                            <div class="w-2/12 h-3/4 bg-green-600 rounded-t-md"></div>
+                        </div>
+                    </div>
+                    
+                    <!-- AI 识别结果 -->
+                    <div class="space-y-3">
+                        <div class="flex items-start gap-3">
+                            <div class="bg-green-500/20 p-2 rounded-lg">
+                                <i data-lucide="trending-up" class="w-5 h-5 text-green-400"></i>
+                            </div>
+                            <div>
+                                <div class="font-medium">看涨吞没形态</div>
+                                <div class="text-sm text-gray-400 mt-1">识别概率: 85%</div>
+                                <div class="text-xs text-gray-500 mt-1">建议: 考虑加仓</div>
+                            </div>
+                        </div>
+                        
+                        <div class="flex items-start gap-3">
+                            <div class="bg-yellow-500/20 p-2 rounded-lg">
+                                <i data-lucide="alert-triangle" class="w-5 h-5 text-yellow-400"></i>
+                            </div>
+                            <div>
+                                <div class="font-medium">MACD 金叉信号</div>
+                                <div class="text-sm text-gray-400 mt-1">识别概率: 78%</div>
+                                <div class="text-xs text-gray-500 mt-1">建议: 密切关注</div>
+                            </div>
+                        </div>
+                        
+                        <div class="flex items-start gap-3">
+                            <div class="bg-blue-500/20 p-2 rounded-lg">
+                                <i data-lucide="info" class="w-5 h-5 text-blue-400"></i>
+                            </div>
+                            <div>
+                                <div class="font-medium">RSI 超卖区域</div>
+                                <div class="text-sm text-gray-400 mt-1">当前值: 32</div>
+                                <div class="text-xs text-gray-500 mt-1">建议: 等待反弹</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- 右侧：实时异动侧边栏 (25%) -->
+            <div class="col-span-12 md:col-span-2">
+                <!-- 大单战报 -->
+                <div class="glass-effect rounded-xl p-4 mb-6 card-hover">
+                    <div class="flex items-center gap-2 mb-4">
+                        <i data-lucide="trending-up" class="w-5 h-5 text-green-400"></i>
+                        <h2 class="text-lg font-semibold">大单战报</h2>
+                    </div>
+                    
+                    <div class="space-y-3">
+                        <div class="bg-white/5 rounded-lg p-3">
+                            <div class="flex justify-between items-start">
+                                <div>
+                                    <div class="text-sm font-medium">宁德时代</div>
+                                    <div class="text-xs text-gray-400">300750</div>
+                                </div>
+                                <div class="text-xs bg-green-500/20 text-green-400 px-2 py-1 rounded">买入</div>
+                            </div>
+                            <div class="flex justify-between items-center mt-2">
+                                <div class="text-sm">186.50</div>
+                                <div class="text-sm font-bold text-green-400">+3.45</div>
+                            </div>
+                            <div class="text-xs text-gray-400 mt-1">成交量: 1.23万手</div>
+                        </div>
+                        
+                        <div class="bg-white/5 rounded-lg p-3">
+                            <div class="flex justify-between items-start">
+                                <div>
+                                    <div class="text-sm font-medium">比亚迪</div>
+                                    <div class="text-xs text-gray-400">002594</div>
+                                </div>
+                                <div class="text-xs bg-red-500/20 text-red-400 px-2 py-1 rounded">卖出</div>
+                            </div>
+                            <div class="flex justify-between items-center mt-2">
+                                <div class="text-sm">235.80</div>
+                                <div class="text-sm font-bold text-red-400">-5.20</div>
+                            </div>
+                            <div class="text-xs text-gray-400 mt-1">成交量: 2.56万手</div>
+                        </div>
+                        
+                        <div class="bg-white/5 rounded-lg p-3">
+                            <div class="flex justify-between items-start">
+                                <div>
+                                    <div class="text-sm font-medium">隆基绿能</div>
+                                    <div class="text-xs text-gray-400">601012</div>
+                                </div>
+                                <div class="text-xs bg-green-500/20 text-green-400 px-2 py-1 rounded">买入</div>
+                            </div>
+                            <div class="flex justify-between items-center mt-2">
+                                <div class="text-sm">42.35</div>
+                                <div class="text-sm font-bold text-green-400">+1.85</div>
+                            </div>
+                            <div class="text-xs text-gray-400 mt-1">成交量: 3.89万手</div>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- 舆情热度 -->
+                <div class="glass-effect rounded-xl p-4 card-hover">
+                    <div class="flex items-center gap-2 mb-4">
+                        <i data-lucide="fire" class="w-5 h-5 text-orange-400"></i>
+                        <h2 class="text-lg font-semibold">舆情热度</h2>
+                    </div>
+                    
+                    <div class="space-y-3">
+                        <div class="bg-white/5 rounded-lg p-3">
+                            <div class="flex justify-between items-center">
+                                <div class="text-sm font-medium">新能源汽车补贴政策</div>
+                                <div class="text-xs bg-orange-500/20 text-orange-400 px-2 py-1 rounded animate-pulse">热</div>
+                            </div>
+                            <div class="text-xs text-gray-400 mt-1">相关股票: 宁德时代、比亚迪</div>
+                            <div class="text-xs text-gray-500 mt-1">热度指数: 92</div>
+                        </div>
+                        
+                        <div class="bg-white/5 rounded-lg p-3">
+                            <div class="flex justify-between items-center">
+                                <div class="text-sm font-medium">AI芯片出口限制</div>
+                                <div class="text-xs bg-orange-500/20 text-orange-400 px-2 py-1 rounded animate-pulse">热</div>
+                            </div>
+                            <div class="text-xs text-gray-400 mt-1">相关股票: 中芯国际、寒武纪</div>
+                            <div class="text-xs text-gray-500 mt-1">热度指数: 88</div>
+                        </div>
+                        
+                        <div class="bg-white/5 rounded-lg p-3">
+                            <div class="flex justify-between items-center">
+                                <div class="text-sm font-medium">医药集采新政策</div>
+                                <div class="text-xs bg-yellow-500/20 text-yellow-400 px-2 py-1 rounded">中</div>
+                            </div>
+                            <div class="text-xs text-gray-400 mt-1">相关股票: 恒瑞医药、药明康德</div>
+                            <div class="text-xs text-gray-500 mt-1">热度指数: 75</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        // 初始化 Lucide 图标
+        lucide.createIcons();
+        
+        // 模拟实时数据更新
+        setInterval(() => {
+            // 这里可以添加实时数据更新逻辑
+        }, 5000);
+    </script>
+</body>
+</html>

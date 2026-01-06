@@ -52,3 +52,73 @@ CREATE TABLE IF NOT EXISTS `t_public_opinion` (
     INDEX `idx_publish_time` (`publish_time`),
     INDEX `idx_stock` (`stock_code`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='舆情分析数据表';
+
+-- ----------------------------
+-- 4. K线数据表 (Kline)
+-- ----------------------------
+CREATE TABLE IF NOT EXISTS `t_kline` (
+    `id` BIGINT NOT NULL AUTO_INCREMENT COMMENT '主键ID',
+    `stock_code` VARCHAR(10) NOT NULL COMMENT '股票代码',
+    `date` DATE NOT NULL COMMENT '日期',
+    `open` INT NOT NULL COMMENT '开盘价(分)',
+    `close` INT NOT NULL COMMENT '收盘价(分)',
+    `high` INT NOT NULL COMMENT '最高价(分)',
+    `low` INT NOT NULL COMMENT '最低价(分)',
+    `volume` BIGINT NOT NULL COMMENT '成交量(股)',
+    `amount` BIGINT NOT NULL COMMENT '成交金额(分)',
+    `create_time` DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    `update_time` DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_stock_date` (`stock_code`, `date`),
+    INDEX `idx_date` (`date`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='K线数据表';
+
+-- ----------------------------
+-- 5. 持仓表 (Position)
+-- ----------------------------
+CREATE TABLE IF NOT EXISTS `t_position` (
+    `id` BIGINT NOT NULL AUTO_INCREMENT COMMENT '主键ID',
+    `stock_code` VARCHAR(10) NOT NULL COMMENT '股票代码',
+    `stock_name` VARCHAR(50) NOT NULL COMMENT '股票名称',
+    `cost_price` INT NOT NULL COMMENT '成本价(分)',
+    `current_price` INT NOT NULL COMMENT '现价(分)',
+    `highest_price` INT NOT NULL COMMENT '持仓期间最高价(分)',
+    `quantity` INT NOT NULL COMMENT '持仓数量(股)',
+    `create_time` DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    `update_time` DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_stock` (`stock_code`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='持仓表';
+
+-- ----------------------------
+-- 6. 风险评估表 (RiskAssessment)
+-- ----------------------------
+CREATE TABLE IF NOT EXISTS `t_risk_assessment` (
+    `id` BIGINT NOT NULL AUTO_INCREMENT COMMENT '主键ID',
+    `total_asset` BIGINT NOT NULL COMMENT '账户总资产(分)',
+    `value_at_risk` BIGINT NOT NULL COMMENT 'VaR值(分)',
+    `health_score` INT NOT NULL COMMENT '账户健康分(0-100)',
+    `risk_warnings` VARCHAR(512) COMMENT '风险警告(逗号分隔)',
+    `suggestion` VARCHAR(255) COMMENT '建议操作',
+    `assessment_time` DATETIME NOT NULL COMMENT '评估时间',
+    `create_time` DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    PRIMARY KEY (`id`),
+    INDEX `idx_assessment_time` (`assessment_time`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='风险评估表';
+
+-- ----------------------------
+-- 7. 舆情汇总表 (OpinionSummary)
+-- ----------------------------
+CREATE TABLE IF NOT EXISTS `t_opinion_summary` (
+    `id` BIGINT NOT NULL AUTO_INCREMENT COMMENT '主键ID',
+    `stock_code` VARCHAR(10) NOT NULL COMMENT '股票代码',
+    `summary_date` DATE NOT NULL COMMENT '汇总日期',
+    `positive_count` INT NOT NULL DEFAULT 0 COMMENT '正面舆情数量',
+    `negative_count` INT NOT NULL DEFAULT 0 COMMENT '负面舆情数量',
+    `neutral_count` INT NOT NULL DEFAULT 0 COMMENT '中性舆情数量',
+    `avg_sentiment_score` DECIMAL(5, 2) NOT NULL DEFAULT 50.00 COMMENT '平均情感评分',
+    `hot_topics` VARCHAR(512) COMMENT '热门话题(逗号分隔)',
+    `create_time` DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_stock_date` (`stock_code`, `summary_date`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='舆情汇总表';

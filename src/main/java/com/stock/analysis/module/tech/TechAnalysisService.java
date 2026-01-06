@@ -5,8 +5,10 @@ import com.stock.analysis.module.chip.StockChip;
 import com.stock.analysis.module.largeorder.LargeOrderMonitorService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.cache.annotation.Cacheable;
 import org.springframework.stereotype.Service;
 
+import java.io.Serializable;
 import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.util.ArrayList;
@@ -109,7 +111,7 @@ public class TechAnalysisService {
     
     @lombok.Data
     @lombok.Builder
-    public static class PatternResult {
+    public static class PatternResult implements Serializable {
         private String stockCode;
         private double dtwDistance;
         private boolean isChipDense;

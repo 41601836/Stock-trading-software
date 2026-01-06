@@ -63,6 +63,26 @@ public class StockChip implements Serializable {
      */
     private BigDecimal concentrationRatio;
 
+    /**
+     * 主筹峰值价格 (单位: 分)
+     */
+    private Integer peakPrice;
+
+    /**
+     * 支撑位 (单位: 分)
+     */
+    private Integer supportLevel;
+
+    /**
+     * 压力位 (单位: 分)
+     */
+    private Integer resistanceLevel;
+
+    /**
+     * 详细筹码分布 (价格 -> 加权筹码量)
+     */
+    private Map<Integer, Double> detailedDistribution;
+
     @JsonFormat(pattern = "yyyy-MM-dd HH:mm:ss")
     private LocalDateTime createTime;
 
