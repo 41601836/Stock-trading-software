@@ -45,4 +45,8 @@ public class Result<T> implements Serializable {
         result.setMsg(msg);
         return result;
     }
+    
+    public static <T> Result<T> error(String msg) {
+        return error(ErrorCode.INTERNAL_SERVER_ERROR.getCode(), msg);
+    }
 }

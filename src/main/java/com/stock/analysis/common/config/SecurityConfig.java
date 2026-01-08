@@ -45,10 +45,18 @@ public class SecurityConfig {
                 .and()
                 // 配置授权规则
                 .authorizeHttpRequests(authorize -> authorize
+                        // 允许访问根路径
+                        .requestMatchers("/").permitAll()
+                        // 允许访问index.html
+                        .requestMatchers("/index.html").permitAll()
                         // 允许Swagger相关接口访问
                         .requestMatchers("/v3/api-docs/**", "/swagger-ui/**", "/swagger-ui.html").permitAll()
                         // 允许登录接口访问
                         .requestMatchers("/api/v1/auth/**").permitAll()
+                        // 允许访问静态资源
+                        .requestMatchers("/static/**", "/css/**", "/js/**", "/images/**", "/favicon.ico").permitAll()
+                        // 允许H2控制台访问
+                        .requestMatchers("/h2-console/**").permitAll()
                         // 其他接口需要认证
                         .anyRequest().authenticated()
                 )

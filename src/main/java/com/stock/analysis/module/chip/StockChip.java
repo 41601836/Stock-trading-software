@@ -9,6 +9,7 @@ import lombok.NoArgsConstructor;
 import java.io.Serializable;
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
+import java.util.Map;
 
 /**
  * 筹码分布实体类
@@ -77,6 +78,21 @@ public class StockChip implements Serializable {
      * 压力位 (单位: 分)
      */
     private Integer resistanceLevel;
+
+    /**
+     * 是否单峰密集
+     */
+    private Boolean isSinglePeak;
+
+    /**
+     * 是否低位
+     */
+    private Boolean isLowPosition;
+
+    /**
+     * 是否低位单峰密集
+     */
+    private Boolean isSinglePeakLow;
 
     /**
      * 详细筹码分布 (价格 -> 加权筹码量)

@@ -57,13 +57,7 @@ public class LargeOrderMonitorService {
                     stockCode, trade.amount / 1000000.0, threshold / 1000000.0, intent);
             
             // 发布系统事件
-            LargeOrderEvent event = new LargeOrderEvent(
-                    this,
-                    trade.stockCode,
-                    trade.amount,
-                    trade.price,
-                    trade.direction
-            );
+            LargeOrderEvent event = new LargeOrderEvent(this, trade.stockCode, trade.amount, trade.price, trade.direction, intent);
             eventPublisher.publishEvent(event);
         } else {
             log.debug("普通成交: amount={}, threshold={}", trade.amount, threshold);
@@ -93,7 +87,7 @@ public class LargeOrderMonitorService {
         }
         
         // 如果没有足够的近期数据，使用默认阈值
-        if (recentTradeAmounts.size() < 50) {
+        if (recentTradeCount.get() < 50) {
             long defaultThreshold = 50_000_000L; // 默认50万
             // 缓存默认阈值
             cacheThreshold(stockCode, defaultThreshold);
@@ -105,7 +99,7 @@ public class LargeOrderMonitorService {
         long[] data = Arrays.copyOf(recentTradeAmounts, count);
         
         // 并行计算均值
-        double mean = Arrays.stream(data).parallel().mapToDouble(Long::doubleValue).average().orElse(0);
+        double mean = Arrays.stream(data).parallel().average().orElse(0);
         
         // 并行计算方差
         double variance = Arrays.stream(data).parallel()

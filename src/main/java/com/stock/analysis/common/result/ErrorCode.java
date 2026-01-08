@@ -1,10 +1,5 @@
 package com.stock.analysis.common.result;
 
-import lombok.AllArgsConstructor;
-import lombok.Getter;
-
-@Getter
-@AllArgsConstructor
 public enum ErrorCode {
     
     SUCCESS(200, "操作成功"),
@@ -28,4 +23,17 @@ public enum ErrorCode {
 
     private final int code;
     private final String msg;
+
+    ErrorCode(int code, String msg) {
+        this.code = code;
+        this.msg = msg;
+    }
+
+    public int getCode() {
+        return code;
+    }
+
+    public String getMsg() {
+        return msg;
+    }
 }

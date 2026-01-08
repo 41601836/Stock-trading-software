@@ -1,9 +1,7 @@
 package com.stock.analysis.common.exception;
 
 import com.stock.analysis.common.result.ErrorCode;
-import lombok.Getter;
 
-@Getter
 public class BusinessException extends RuntimeException {
 
     private final int code;
@@ -19,5 +17,13 @@ public class BusinessException extends RuntimeException {
         super(msg);
         this.code = code;
         this.msg = msg;
+    }
+
+    public int getCode() {
+        return code;
+    }
+
+    public String getMsg() {
+        return msg;
     }
 }

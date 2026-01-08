@@ -1,6 +1,7 @@
 package com.stock.analysis.module.tech;
 
-import java.util.HashMap;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ForkJoinPool;
@@ -23,10 +24,35 @@ public class DTWUtil {
     private static final double EARLY_TERMINATION_THRESHOLD = 50.0;
     
     // 缓存：存储常用序列对的DTW距离
-    private static final Map<String, Double> dtwCache = new HashMap<>();
+    private static final Map<String, CacheEntry> dtwCache = new LinkedHashMap<String, CacheEntry>(100, 0.75f, true) {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<String, CacheEntry> eldest) {
+            // 当缓存大小超过2000时，移除最旧的条目
+            return size() > 2000;
+        }
+    };
+    
+    // 缓存条目类，包含缓存值和过期时间
+    private static class CacheEntry {
+        private final double value;
+        private final long expirationTime; // 过期时间（毫秒）
+        
+        public CacheEntry(double value, long ttlMs) {
+            this.value = value;
+            this.expirationTime = System.currentTimeMillis() + ttlMs;
+        }
+        
+        public double getValue() {
+            return value;
+        }
+        
+        public boolean isExpired() {
+            return System.currentTimeMillis() > expirationTime;
+        }
+    }
     
     // 线程池：用于并行计算
-    private static final ForkJoinPool forkJoinPool = new ForkJoinPool();
+    private static final ForkJoinPool forkJoinPool = new ForkJoinPool(Runtime.getRuntime().availableProcessors() * 2);
     
     // 特征空间降维阈值：当序列长度超过此值时进行降维
     private static final int DIMENSIONALITY_REDUCTION_THRESHOLD = 300;
@@ -61,8 +87,9 @@ public class DTWUtil {
         String cacheKey = generateCacheKey(s1, s2, windowRatio);
         
         // 检查缓存
-        if (dtwCache.containsKey(cacheKey)) {
-            return dtwCache.get(cacheKey);
+        CacheEntry entry = dtwCache.get(cacheKey);
+        if (entry != null && !entry.isExpired()) {
+            return entry.getValue();
         }
         
         // 根据序列长度选择计算策略
@@ -75,15 +102,11 @@ public class DTWUtil {
             result = calculateDTWSequential(s1, s2, windowRatio);
         }
         
-        // 缓存结果
-        dtwCache.put(cacheKey, result);
+        // 缓存结果（5分钟过期）
+        dtwCache.put(cacheKey, new CacheEntry(result, 5 * 60 * 1000));
         
-        // 限制缓存大小
-        if (dtwCache.size() > 1000) {
-            // 移除最旧的缓存项 (简单实现)
-            String oldestKey = dtwCache.keySet().iterator().next();
-            dtwCache.remove(oldestKey);
-        }
+        // 清理过期缓存条目
+        cleanupExpiredCache();
         
         return result;
     }
@@ -172,22 +195,174 @@ public class DTWUtil {
     
     /**
      * 并行计算 DTW 距离 (使用ForkJoin框架)
-     * 注意：DTW算法的并行化比较复杂，这里使用的是将序列分成多个子序列的近似并行策略
+     * 实现真正的并行DTW算法，将序列分割成多个子问题
      */
     private static double calculateDTWParallel(List<Double> s1, List<Double> s2, double windowRatio) {
+        // 对长序列进行降维处理
+        List<Double> reducedS1 = reduceDimensionality(s1);
+        List<Double> reducedS2 = reduceDimensionality(s2);
+        
         // 对于长序列，使用更高效的窗口策略
         double adjustedWindowRatio = Math.max(windowRatio, 0.15);
-        return calculateDTWSequential(s1, s2, adjustedWindowRatio);
+        
+        // 使用ForkJoin框架进行并行计算
+        DTWTask task = new DTWTask(reducedS1, reducedS2, adjustedWindowRatio);
+        return forkJoinPool.invoke(task);
+    }
+    
+    /**
+     * 序列降维处理
+     * 对过长的序列进行降维，减少计算量
+     */
+    private static List<Double> reduceDimensionality(List<Double> sequence) {
+        int n = sequence.size();
+        if (n <= DIMENSIONALITY_REDUCTION_THRESHOLD) {
+            return sequence; // 不需要降维
+        }
+        
+        // 计算降维后的序列长度
+        int reducedLength = (int) (n * REDUCTION_FACTOR);
+        if (reducedLength < 10) {
+            reducedLength = 10; // 确保降维后的序列至少有10个点
+        }
+        
+        // 使用滑动窗口平均法进行降维，保持序列的趋势特征
+        List<Double> reducedSequence = new ArrayList<>();
+        int windowSize = n / reducedLength;
+        
+        for (int i = 0; i < reducedLength; i++) {
+            int startIdx = i * windowSize;
+            int endIdx = Math.min((i + 1) * windowSize, n);
+            
+            // 计算窗口内的平均值
+            double sum = 0;
+            for (int j = startIdx; j < endIdx; j++) {
+                sum += sequence.get(j);
+            }
+            reducedSequence.add(sum / (endIdx - startIdx));
+        }
+        
+        // 处理剩余的点
+        if (reducedSequence.size() < reducedLength) {
+            int startIdx = reducedLength * windowSize;
+            if (startIdx < n) {
+                double sum = 0;
+                for (int j = startIdx; j < n; j++) {
+                    sum += sequence.get(j);
+                }
+                reducedSequence.add(sum / (n - startIdx));
+            }
+        }
+        
+        return reducedSequence;
+    }
+    
+    /**
+     * DTW并行计算任务
+     * 基于ForkJoin框架的递归并行任务
+     */
+    private static class DTWTask extends RecursiveTask<Double> {
+        private static final long serialVersionUID = 1L;
+        
+        private static final int TASK_THRESHOLD = 50; // 子任务分割阈值
+        
+        private final List<Double> s1;
+        private final List<Double> s2;
+        private final double windowRatio;
+        
+        public DTWTask(List<Double> s1, List<Double> s2, double windowRatio) {
+            this.s1 = s1;
+            this.s2 = s2;
+            this.windowRatio = windowRatio;
+        }
+        
+        @Override
+        protected Double compute() {
+            int n = s1.size();
+            int m = s2.size();
+            
+            // 如果序列长度小于阈值，直接使用顺序计算
+            if (n <= TASK_THRESHOLD && m <= TASK_THRESHOLD) {
+                return calculateDTWSequential(s1, s2, windowRatio);
+            }
+            
+            // 将序列分割为子序列进行并行计算
+            if (n > m) {
+                // 如果s1更长，分割s1
+                int mid = n / 2;
+                List<Double> s1Left = s1.subList(0, mid);
+                List<Double> s1Right = s1.subList(mid, n);
+                
+                DTWTask leftTask = new DTWTask(s1Left, s2, windowRatio);
+                DTWTask rightTask = new DTWTask(s1Right, s2, windowRatio);
+                
+                // 并行执行两个子任务
+                leftTask.fork();
+                double rightResult = rightTask.compute();
+                double leftResult = leftTask.join();
+                
+                // 合并结果：取两个子结果的加权平均值
+                return (leftResult * mid + rightResult * (n - mid)) / n;
+            } else {
+                // 如果s2更长，分割s2
+                int mid = m / 2;
+                List<Double> s2Left = s2.subList(0, mid);
+                List<Double> s2Right = s2.subList(mid, m);
+                
+                DTWTask leftTask = new DTWTask(s1, s2Left, windowRatio);
+                DTWTask rightTask = new DTWTask(s1, s2Right, windowRatio);
+                
+                // 并行执行两个子任务
+                leftTask.fork();
+                double rightResult = rightTask.compute();
+                double leftResult = leftTask.join();
+                
+                // 合并结果：取两个子结果的加权平均值
+                return (leftResult * mid + rightResult * (m - mid)) / m;
+            }
+        }
     }
     
     /**
      * 生成缓存键
      */
     private static String generateCacheKey(List<Double> s1, List<Double> s2, double windowRatio) {
-        // 使用序列的哈希码和窗口大小生成唯一键
-        String s1Hash = s1.stream().map(d -> String.format("%.4f", d)).collect(Collectors.joining(","));
-        String s2Hash = s2.stream().map(d -> String.format("%.4f", d)).collect(Collectors.joining(","));
-        return String.format("%s|%s|%.2f", s1Hash, s2Hash, windowRatio);
+        // 使用高效的哈希算法生成缓存键，避免生成过长的字符串
+        int s1HashCode = calculateSequenceHashCode(s1);
+        int s2HashCode = calculateSequenceHashCode(s2);
+        return String.format("%d|%d|%.2f", s1HashCode, s2HashCode, windowRatio);
+    }
+    
+    /**
+     * 计算序列的哈希码
+     */
+    private static int calculateSequenceHashCode(List<Double> sequence) {
+        int result = 1;
+        int step = Math.max(1, sequence.size() / 10); // 采样计算，提高效率
+        for (int i = 0; i < sequence.size(); i += step) {
+            long bits = Double.doubleToLongBits(sequence.get(i));
+            result = 31 * result + (int) (bits ^ (bits >>> 32));
+        }
+        return result;
+    }
+    
+    /**
+     * 清理过期的缓存条目
+     */
+    private static void cleanupExpiredCache() {
+        // 每100次调用清理一次过期缓存
+        if (dtwCache.size() % 100 == 0) {
+            List<String> expiredKeys = new ArrayList<>();
+            for (Map.Entry<String, CacheEntry> entry : dtwCache.entrySet()) {
+                if (entry.getValue().isExpired()) {
+                    expiredKeys.add(entry.getKey());
+                }
+            }
+            
+            for (String key : expiredKeys) {
+                dtwCache.remove(key);
+            }
+        }
     }
     
     /**

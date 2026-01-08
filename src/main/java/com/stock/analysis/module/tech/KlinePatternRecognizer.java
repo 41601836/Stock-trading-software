@@ -37,7 +37,7 @@ public class KlinePatternRecognizer {
         public PatternRecognitionResult(PatternType patternType, double confidence, Map<String, Object> details) {
             this.patternType = patternType;
             this.confidence = confidence;
-            this.patternName = getPatternName(patternType);
+            this.patternName = getPatternTypeName(patternType);
             this.details = details;
         }
 
@@ -84,7 +84,7 @@ public class KlinePatternRecognizer {
         // 实际项目中，这里会将数据输入到预训练的CNN模型
         PatternRecognitionResult result = mockCNNInference(normalizedData, technicalFeatures);
 
-        log.debug("形态识别完成: {} (置信度: {:.2f})");
+        log.debug("形态识别完成: {} (置信度: {:.2f})", result.getPatternName(), result.getConfidence());
 
         return result;
     }
@@ -99,9 +99,10 @@ public class KlinePatternRecognizer {
 
         // 计算最高价和最低价（用于归一化）
         int maxPrice = closePrices.stream().max(Integer::compareTo).orElse(1);
-        int minPrice = closePrices.stream().min(Integer::compareTo).orElse(0);
-        double priceRange = maxPrice - minPrice;
-        if (priceRange == 0) priceRange = 1;
+        final int minPrice = closePrices.stream().min(Integer::compareTo).orElse(0);
+        double priceRangeTemp = maxPrice - minPrice;
+        if (priceRangeTemp == 0) priceRangeTemp = 1;
+        final double priceRange = priceRangeTemp;
 
         // 计算最大成交量（用于归一化） - 只计算一次
         long maxVolume = klines.stream().map(Kline::getVolume).max(Long::compareTo).orElse(1L);
@@ -198,11 +199,11 @@ public class KlinePatternRecognizer {
         
         return summary;
     }
-
+    
     /**
      * 获取形态名称
      */
-    private static String getPatternName(PatternType patternType) {
+    private static String getPatternTypeName(PatternType patternType) {
         Map<PatternType, String> patternNames = new EnumMap<>(PatternType.class);
         patternNames.put(PatternType.DOUBLE_BOTTOM, "双底形态");
         patternNames.put(PatternType.DOUBLE_TOP, "双顶形态");
@@ -241,5 +242,85 @@ public class KlinePatternRecognizer {
         }
 
         return input;
+    }
+
+    /**
+     * 获取带技术指标的增强CNN输入数据
+     * 包含OHLCV和技术指标特征
+     */
+    public double[][][] getEnhancedCNNInput(List<Kline> klines, int inputLength) {
+        // 确保K线数据足够长
+        if (klines.size() < inputLength) {
+            throw new IllegalArgumentException("K线数据不足，需要至少" + inputLength + "根K线");
+        }
+
+        // 截取最新的K线数据
+        List<Kline> recentKlines = klines.subList(Math.max(0, klines.size() - inputLength), klines.size());
+
+        // 归一化K线数据
+        List<double[]> normalizedData = normalizeKlineData(recentKlines);
+
+        // 提取技术特征
+        Map<String, double[]> technicalFeatures = extractTechnicalFeatures(recentKlines);
+
+        // 转换为CNN输入格式 [batch_size, sequence_length, feature_dimension]
+        // 增强版包含OHLCV(5) + 技术指标(9) = 14个特征
+        double[][][] input = new double[1][inputLength][14];
+        
+        for (int i = 0; i < recentKlines.size(); i++) {
+            // 复制OHLCV数据
+            System.arraycopy(normalizedData.get(i), 0, input[0][i], 0, 5);
+            
+            // 添加技术指标数据
+            input[0][i][5] = technicalFeatures.get("MA5")[i];
+            input[0][i][6] = technicalFeatures.get("MA10")[i];
+            input[0][i][7] = technicalFeatures.get("MA20")[i];
+            input[0][i][8] = technicalFeatures.get("RSI14")[i];
+            input[0][i][9] = technicalFeatures.get("MACD")[i];
+            input[0][i][10] = technicalFeatures.get("MACD_SIGNAL")[i];
+            input[0][i][11] = technicalFeatures.get("BOLL_UPPER")[i];
+            input[0][i][12] = technicalFeatures.get("BOLL_MIDDLE")[i];
+            input[0][i][13] = technicalFeatures.get("BOLL_LOWER")[i];
+        }
+
+        return input;
+    }
+
+    /**
+     * 验证CNN模型输入数据的有效性
+     */
+    public boolean validateCNNInput(double[][][] input) {
+        if (input == null || input.length == 0 || input[0].length == 0 || input[0][0].length == 0) {
+            log.error("CNN输入数据无效: 维度不正确");
+            return false;
+        }
+
+        // 检查数据是否包含NaN或无穷大值
+        for (int i = 0; i < input.length; i++) {
+            for (int j = 0; j < input[i].length; j++) {
+                for (int k = 0; k < input[i][j].length; k++) {
+                    if (Double.isNaN(input[i][j][k]) || Double.isInfinite(input[i][j][k])) {
+                        log.error("CNN输入数据无效: 包含NaN或无穷大值 at [{},{},{}]", i, j, k);
+                        return false;
+                    }
+                }
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * 获取模型性能统计信息
+     */
+    public Map<String, Object> getModelPerformanceStats() {
+        Map<String, Object> stats = new HashMap<>();
+        // 实际项目中，这里会返回真实的模型性能指标
+        stats.put("modelVersion", "v1.0.0");
+        stats.put("trainingAccuracy", 0.89);
+        stats.put("validationAccuracy", 0.85);
+        stats.put("inferenceTimeMs", 25.5);
+        stats.put("supportedPatterns", Arrays.asList(PatternType.values()));
+        return stats;
     }
 }

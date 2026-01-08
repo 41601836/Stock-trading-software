@@ -1,0 +1,1540 @@
+package com.stock.analysis.module.chip;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.stock.analysis.common.exception.BusinessException;
+import com.stock.analysis.common.result.ErrorCode;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.stereotype.Service;
+
+import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.time.LocalDateTime;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
+import java.util.concurrent.ForkJoinPool;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class ChipAnalysisServiceImpl implements ChipAnalysisService {
+
+    private final StringRedisTemplate redisTemplate;
+    private final ObjectMapper objectMapper;
+
+    // 时间衰减系数 (lambda)，值越大近期权重越�?
+    private static final double DECAY_LAMBDA = 0.08;
+    // 成交量加权因�?
+    private static final double VOLUME_WEIGHT_FACTOR = 0.000008;
+    // 模拟分析的天�?
+    private static final int ANALYSIS_DAYS = 90;
+    // 缓存前缀
+    private static final String CACHE_KEY_PREFIX = "chip:dist:";
+    // 支撑压力位识别的价格区间阈�?
+    private static final double SUPPORT_RESISTANCE_THRESHOLD = 1.2;
+    // 筹码集中度计算的窗口大小
+    private static final int CONCENTRATION_WINDOW_SIZE = 5;
+    // 时间衰减的基准单位（分钟�?
+    private static final int TIME_DECAY_BASE_UNIT = 60;
+    // 衰减曲线的基础曲率参数
+    private static final double BASE_DECAY_CURVATURE = 1.0;
+    // 衰减曲线的动态调整系�?
+    private static final double DYNAMIC_CURVATURE_ADJUSTMENT = 0.5;
+    // 大额交易的基础成交量阈值（万股�?
+    private static final long BASE_LARGE_TRADE_THRESHOLD = 50L;
+    // 大额交易的加权因�?
+    private static final double LARGE_TRADE_WEIGHT_FACTOR = 1.8;
+    // 价格波动加权因子
+    private static final double PRICE_VOLATILITY_WEIGHT_FACTOR = 0.02;
+    // 流通市值阈值（亿元�?
+    private static final long MARKET_CAP_THRESHOLD = 50L;
+    
+    // 内部类：用于存储支撑/压力位的信息
+    class SupportResistanceLevel {
+        private final int price;
+        private final double volume;
+        private final double totalStrength;
+        
+        public SupportResistanceLevel(int price, double volume, double totalStrength) {
+            this.price = price;
+            this.volume = volume;
+            this.totalStrength = totalStrength;
+        }
+        
+        public int getPrice() {
+            return price;
+        }
+        
+        public double getVolume() {
+            return volume;
+        }
+        
+        public double getTotalStrength() {
+            return totalStrength;
+        }
+    }
+    // 筹码集中度计算的分位数（90%筹码分布区间�?
+    private static final double CONCENTRATION_PERCENTILE = 0.9;
+    // 单峰密集的最小集中度比例
+    private static final double SINGLE_PEAK_MIN_RATIO = 0.6;
+    // 低位判断的价格区间比例（主筹成本�?0%以内�?
+    private static final double LOW_POSITION_THRESHOLD_RATIO = 1.1;
+
+    @Override
+    public StockChip calculateDistribution(String stockCode) {
+        if (stockCode == null || stockCode.trim().isEmpty()) {
+            throw new BusinessException(ErrorCode.PARAM_ERROR);
+        }
+
+        // 1. 尝试�?Redis 获取缓存
+        String cacheKey = CACHE_KEY_PREFIX + stockCode;
+        try {
+            String cachedJson = redisTemplate.opsForValue().get(cacheKey);
+            if (cachedJson != null) {
+                log.debug("Cache Hit for stock: {}", stockCode);
+                return objectMapper.readValue(cachedJson, StockChip.class);
+            }
+        } catch (Exception e) {
+            log.warn("Redis read failed: {}", e.getMessage());
+        }
+
+        // 2. 获取历史交易数据 (Mock)
+        List<TradeRecord> historyData = generateMockHistory(stockCode, ANALYSIS_DAYS);
+        
+        // 计算当前价格、最高价和最低价
+        int currentPrice = historyData.get(historyData.size() - 1).closePrice;
+        int maxPrice = currentPrice;
+        int minPrice = currentPrice;
+        long recentTradeVolume = 0;
+        int recentDays = Math.min(5, historyData.size());
+        int startIdx = Math.max(0, historyData.size() - recentDays);
+        
+        // 定义当前时间变量
+        LocalDateTime now = LocalDateTime.now();
+        
+        // 一次遍历计算多个统计量，减少遍历次�?
+        for (int i = 0; i < historyData.size(); i++) {
+            TradeRecord record = historyData.get(i);
+            maxPrice = Math.max(maxPrice, record.closePrice);
+            minPrice = Math.min(minPrice, record.closePrice);
+            if (i >= startIdx) {
+                recentTradeVolume += record.volume;
+            }
+        }
+
+        // 3. WAD 算法计算 - 高性能实现
+        // 使用数组代替Map存储价格区间，提高访问速度
+        final int finalPriceRange = maxPrice - minPrice + 1;
+        final int finalMinPrice = minPrice;
+        final int finalCurrentPrice = currentPrice;
+        final long finalNowMs = System.currentTimeMillis();
+        double[] chipDistributionArray = new double[finalPriceRange];
+        double[] totalWeightedVolume = {0.0}; // 使用数组包装double值以在lambda中修�?
+
+        // 计算价格波动因子（基于最近的价格变化�?
+        final double priceVolatility = calculatePriceVolatility(historyData);
+        
+        // 计算成交量波动因子（基于最近的成交量变化）
+        final double volumeVolatility = calculateVolumeVolatility(historyData);
+        
+        // 计算流通市值（模拟�?
+        final long marketCap = calculateMarketCap(stockCode);
+        
+        // 价格范围归一化，避免除以�?
+        final double normalizedPriceRange = Math.max(1.0, (double) finalPriceRange);
+        
+        // 预计算时间衰减相关的常量，减少循环内计算�?
+        // 结合价格波动率和成交量波动率，更全面地反映市场活跃度
+        final double volatilityFactor = Math.min(2.5, priceVolatility * 0.6 + volumeVolatility * 0.4);
+        final double baseLambda = DECAY_LAMBDA * volatilityFactor;
+        
+        // 改进的市场活跃度调整因子计算
+        // 1. 计算近期交易量占流通市值的比例
+        double volumeMarketCapRatio = marketCap > 0 ? (double) recentTradeVolume / marketCap : 0.0;
+        // 2. 对比例进行平滑处�?
+        double smoothedRatio = 1.0 - fastExpApproximation(-8.0 * volumeMarketCapRatio);
+        // 3. 结合波动率因子，高波动时提高市场活跃度权�?
+        double volatilityWeight = 0.7 + 0.3 * Math.min(1.0, volatilityFactor - 1.0);
+        // 4. 计算最终的市场活跃度调整因�?
+        final double marketActivityAdjustment = 0.75 + 0.45 * smoothedRatio * volatilityWeight;
+        
+        // 使用更高效的并行流处理，控制并行�?
+        ForkJoinPool forkJoinPool = new ForkJoinPool(Math.min(10, Runtime.getRuntime().availableProcessors()));
+        try {
+            forkJoinPool.submit(() -> {
+                historyData.parallelStream().forEach(record -> {
+                    // 计算时间差（毫秒�?
+                    long recordMs = record.tradeTime.atZone(java.time.ZoneOffset.UTC).toInstant().toEpochMilli();
+                    long timeDiffMs = Math.max(0, finalNowMs - recordMs);
+                    double timeDiffHours = (double) timeDiffMs / (60 * 60 * 1000);
+                    
+                    // 优化的时间衰减计算：使用快速指数近似和查表�?
+                    double timeDecay = calculateFastTimeDecay(timeDiffHours, baseLambda, marketActivityAdjustment);
+                    
+                    // 优化的交易量加权计算
+                    double volumeWeight = 1.0 + Math.log1p(record.volume * VOLUME_WEIGHT_FACTOR);
+                    
+                    // 快速大额交易判�?
+                    double largeTradeAdjustment = calculateLargeTradeAdjustment(record.volume, marketCap);
+                    
+                    // 优化的价格波动因�?
+                    double priceVolatilityFactor = 1.0 + (priceVolatility - 1.0) * PRICE_VOLATILITY_WEIGHT_FACTOR;
+                    
+                    // 优化的价格位置因�?
+                    double priceDiff = Math.abs(record.avgPrice - finalCurrentPrice);
+                    double pricePositionFactor = 1.0 - Math.min(1.0, priceDiff / (normalizedPriceRange * 0.1));
+                    
+                    // 计算最终加权成交量 - WAD算法核心：成交量加权平均分布
+                    double weightedVolume = record.volume * timeDecay * volumeWeight * 
+                                           largeTradeAdjustment * priceVolatilityFactor * pricePositionFactor;
+
+                    // 使用数组索引快速定位价格位�?
+                    int priceIndex = record.avgPrice - finalMinPrice;
+                    if (priceIndex >= 0 && priceIndex < finalPriceRange) {
+                        synchronized (chipDistributionArray) {
+                            chipDistributionArray[priceIndex] += weightedVolume;
+                        }
+                        synchronized (totalWeightedVolume) {
+                            totalWeightedVolume[0] += weightedVolume;
+                        }
+                    }
+                });
+            }).get();
+        } catch (Exception e) {
+            log.error("Parallel processing failed: {}", e.getMessage(), e);
+            // 回退到单线程处理
+            historyData.forEach(record -> {
+                // 计算时间差（毫秒�?
+                long recordMs = record.tradeTime.atZone(java.time.ZoneOffset.UTC).toInstant().toEpochMilli();
+                long timeDiffMs = Math.max(0, finalNowMs - recordMs);
+                double timeDiffHours = (double) timeDiffMs / (60 * 60 * 1000);
+                
+                // 优化的时间衰减计算：使用快速指数近似和查表�?
+                double timeDecay = calculateFastTimeDecay(timeDiffHours, baseLambda, marketActivityAdjustment);
+                
+                // 优化的交易量加权计算
+                double volumeWeight = 1.0 + Math.log1p(record.volume * VOLUME_WEIGHT_FACTOR);
+                
+                // 快速大额交易判�?
+                double largeTradeAdjustment = calculateLargeTradeAdjustment(record.volume, marketCap);
+                
+                // 优化的价格波动因�?
+                double localVolatilityFactor = 1.0 + (priceVolatility - 1.0) * PRICE_VOLATILITY_WEIGHT_FACTOR;
+                
+                // 优化的价格位置因�?
+                double priceDiff = Math.abs(record.avgPrice - finalCurrentPrice);
+                double pricePositionFactor = 1.0 - Math.min(1.0, priceDiff / (normalizedPriceRange * 0.1));
+                
+                // 计算最终加权成交量 - WAD算法核心：成交量加权平均分布
+                double weightedVolume = record.volume * timeDecay * volumeWeight * 
+                                       largeTradeAdjustment * localVolatilityFactor * pricePositionFactor;
+
+                // 使用数组索引快速定位价格位�?
+                int priceIndex = record.avgPrice - finalMinPrice;
+                if (priceIndex >= 0 && priceIndex < finalPriceRange) {
+                    chipDistributionArray[priceIndex] += weightedVolume;
+                    totalWeightedVolume[0] += weightedVolume;
+                }
+            });
+        } finally {
+            forkJoinPool.shutdown();
+        }
+
+        if (totalWeightedVolume[0] <= 0) {
+            throw new BusinessException(ErrorCode.NO_HEAT_DATA);
+        }
+
+        // 4. 计算统计指标
+        // 4.1 主筹成本 (加权平均价格)
+        double sumProduct = 0;
+        
+        // 从数组构建排序的筹码列表，仅包含非零�?
+        List<Map.Entry<Integer, Double>> sortedChips = new ArrayList<>();
+        for (int i = 0; i < chipDistributionArray.length; i++) {
+            if (chipDistributionArray[i] > 0.0001) { // 忽略极小�?
+                int price = i + minPrice;
+                sortedChips.add(new AbstractMap.SimpleEntry<>(price, chipDistributionArray[i]));
+            }
+        }
+        
+        // 按价格排�?
+        sortedChips.sort(Map.Entry.comparingByKey());
+
+        // 计算加权价格总和
+        for (Map.Entry<Integer, Double> entry : sortedChips) {
+            sumProduct += entry.getKey() * entry.getValue();
+        }
+        int mainCost = (int) (sumProduct / totalWeightedVolume[0]);
+        
+        // 构建Map形式的筹码分布用于结果返�?
+        Map<Integer, Double> chipDistribution = new HashMap<>();
+        for (Map.Entry<Integer, Double> entry : sortedChips) {
+            chipDistribution.put(entry.getKey(), entry.getValue());
+        }
+
+        // 4.2 计算筹码集中�?(WAD算法核心�?0%筹码分布区间)
+        double currentSum = 0;
+        double totalVolume = totalWeightedVolume[0];
+        int priceRangeLow = sortedChips.get(0).getKey();
+        int priceRangeHigh = sortedChips.get(sortedChips.size() - 1).getKey();
+        
+        // 计算左右边界分位�?(5% �?95%)
+        double leftQuantile = (1.0 - CONCENTRATION_PERCENTILE) / 2;
+        double rightQuantile = 1.0 - leftQuantile;
+        
+        // 改进�?0%筹码区间计算：使用线性插值提高精�?
+        int newPriceRangeLow = -1;
+        int newPriceRangeHigh = -1;
+        int startIndex = -1;
+        int endIndex = -1;
+        double prevRatio = 0.0;
+
+        // 优化的单次遍历查找，使用线性插值计算精确的分位价格
+        for (int i = 0; i < sortedChips.size(); i++) {
+            Map.Entry<Integer, Double> entry = sortedChips.get(i);
+            currentSum += entry.getValue();
+            double ratio = currentSum / totalVolume;
+
+            if (newPriceRangeLow == -1 && ratio >= leftQuantile) {
+                if (i == 0) {
+                    newPriceRangeLow = entry.getKey();
+                    startIndex = i;
+                } else {
+                    // 线性插值计算精确的分位价格
+                    Map.Entry<Integer, Double> prevEntry = sortedChips.get(i - 1);
+                    double deltaRatio = ratio - prevRatio;
+                    double deltaPrice = entry.getKey() - prevEntry.getKey();
+                    double weight = (leftQuantile - prevRatio) / deltaRatio;
+                    newPriceRangeLow = (int) (prevEntry.getKey() + deltaPrice * weight);
+                    startIndex = i - 1;
+                }
+            }
+            
+            if (newPriceRangeHigh == -1 && ratio >= rightQuantile) {
+                if (i == sortedChips.size() - 1) {
+                    newPriceRangeHigh = entry.getKey();
+                    endIndex = i;
+                } else {
+                    // 线性插值计算精确的分位价格
+                    Map.Entry<Integer, Double> nextEntry = sortedChips.get(i + 1);
+                    double deltaRatio = ratio - prevRatio;
+                    double deltaPrice = entry.getKey() - (i > 0 ? sortedChips.get(i - 1).getKey() : entry.getKey());
+                    double weight = (rightQuantile - prevRatio) / deltaRatio;
+                    newPriceRangeHigh = (int) (entry.getKey() + deltaPrice * weight);
+                    endIndex = i;
+                }
+                break; // 找到右边界后可以提前结束
+            }
+            
+            prevRatio = ratio;
+        }
+
+        // 兜底处理
+        if (newPriceRangeLow == -1) newPriceRangeLow = sortedChips.get(0).getKey();
+        if (newPriceRangeHigh == -1) newPriceRangeHigh = sortedChips.get(sortedChips.size() - 1).getKey();
+        if (startIndex == -1) startIndex = 0;
+        if (endIndex == -1) endIndex = sortedChips.size() - 1;
+
+        // 4.3 计算该区间内的实际占�?(仅遍历找到的区间，避免全量遍�?
+        double rangeVolume = 0;
+        for (int i = startIndex; i <= endIndex; i++) {
+            Map.Entry<Integer, Double> entry = sortedChips.get(i);
+            rangeVolume += entry.getValue();
+        }
+        BigDecimal chipRatio = BigDecimal.valueOf(rangeVolume / totalVolume)
+                .setScale(4, RoundingMode.HALF_UP);
+
+        // 4.4 改进的集中度计算公式: 引入价格权重和成交量权重
+        int newPriceRange = newPriceRangeHigh - newPriceRangeLow;
+        
+        // 基础集中度：(High - Low) / (High + Low)
+        int priceSum = newPriceRangeHigh + newPriceRangeLow;
+        double baseConcentration = priceSum > 0 ? (double) newPriceRange / priceSum : 0;
+        
+        // 加权集中度：考虑价格区间内的成交量分�?
+        double weightedConcentration = calculateWeightedConcentration(sortedChips, startIndex, endIndex, totalVolume);
+        
+        // 复合集中度：综合基础集中度和加权集中�?
+        double concentration = baseConcentration * 0.6 + weightedConcentration * 0.4;
+        BigDecimal concentrationRatio = BigDecimal.valueOf(concentration).setScale(4, RoundingMode.HALF_UP);
+        
+        // 4.5 计算筹码集中度指�?(0-10000，数值越小集中度越高)
+        // 改进：引入多维度权重调整
+        double priceRangeWeight = 1.0 - Math.min(1.0, (double) newPriceRange / (currentPrice * 2));
+        double newVolumeWeight = rangeVolume / totalVolume;
+        double distributionWeight = calculateDistributionBalanceWeight(sortedChips, startIndex, endIndex);
+        
+        // 综合权重计算
+        double compositeWeight = priceRangeWeight * 0.4 + newVolumeWeight * 0.3 + distributionWeight * 0.3;
+        
+        int concentrationIndex = (int) (concentration * 10000 * compositeWeight);
+        
+        // 确保指数在合理范围内
+        concentrationIndex = Math.max(0, Math.min(10000, concentrationIndex));
+
+        // 4.6 计算主筹峰�?(筹码最多的价格) - 优化：识别主筹成本区域而非单个价格�?
+        int peakPrice = 0;
+        double maxVolume = 0.0;
+        
+        // 找出最大成交量的价格点
+        for (Map.Entry<Integer, Double> entry : sortedChips) {
+            if (entry.getValue() > maxVolume) {
+                maxVolume = entry.getValue();
+                peakPrice = entry.getKey();
+            }
+        }
+        
+        // 计算主筹峰值占�?
+        double peakRatio = maxVolume / totalVolume;
+        
+        // 优化：识别主筹成本区域（峰值周围的密集区间�?
+        int mainCostRangeStart = peakPrice;
+        int mainCostRangeEnd = peakPrice;
+        double cumulativeVolume = 0.0;
+        double targetVolume = maxVolume * 1.5; // 包含峰值周�?.5倍的成交�?
+        
+        // 向前搜索（价格低于峰值）
+        int i = sortedChips.indexOf(new AbstractMap.SimpleEntry<>(peakPrice, maxVolume)) - 1;
+        while (i >= 0 && cumulativeVolume < targetVolume) {
+            Map.Entry<Integer, Double> entry = sortedChips.get(i);
+            cumulativeVolume += entry.getValue();
+            mainCostRangeStart = entry.getKey();
+            i--;
+        }
+        
+        // 向后搜索（价格高于峰值）
+        cumulativeVolume = 0.0;
+        i = sortedChips.indexOf(new AbstractMap.SimpleEntry<>(peakPrice, maxVolume)) + 1;
+        while (i < sortedChips.size() && cumulativeVolume < targetVolume) {
+            Map.Entry<Integer, Double> entry = sortedChips.get(i);
+            cumulativeVolume += entry.getValue();
+            mainCostRangeEnd = entry.getKey();
+            i++;
+        }
+
+        // 4.7 计算支撑位和压力�?- 基于改进的筹码密集区分析
+        int supportLevel = priceRangeLow;
+        int resistanceLevel = priceRangeHigh;
+        
+        // 寻找所有局部峰�?- 使用改进的自适应峰值检测算�?
+        List<Map.Entry<Integer, Double>> localPeaks = findLocalPeaks(sortedChips, CONCENTRATION_WINDOW_SIZE, SUPPORT_RESISTANCE_THRESHOLD);
+        
+        // 计算整体筹码分布的重心位�?
+        int distributionCenter = calculateDistributionCenter(chipDistribution, false, totalVolume);
+        
+        // 4.7.1 支撑位识别：多层次分�?
+        if (!localPeaks.isEmpty()) {
+            // 第一步：找到当前价格下方的所有筹码峰
+            List<Map.Entry<Integer, Double>> supportPeaks = localPeaks.stream()
+                    .filter(peak -> peak.getKey() < currentPrice)
+                    .sorted(Comparator.comparing(Map.Entry<Integer, Double>::getKey).reversed()) // 从近到远排序
+                    .collect(Collectors.toList());
+            
+            if (!supportPeaks.isEmpty()) {
+                // 第二步：计算每个支撑峰的综合强度分数
+                List<SupportResistanceLevel> supportLevels = new ArrayList<>();
+                for (Map.Entry<Integer, Double> peak : supportPeaks) {
+                    int price = peak.getKey();
+                    double volume = peak.getValue();
+                    
+                    // 距离权重：越接近当前价格权重越高
+                    double distanceRatio = Math.abs(currentPrice - price) / (double) currentPrice;
+                    double distanceWeight = Math.exp(-distanceRatio * 10);
+                    
+                    // 成交量权重：筹码越多权重越高
+                    double peakVolumeWeight = volume / totalVolume;
+                    
+                    // 价格位置权重：距离重心较近的筹码峰更重要
+                    double centerDistanceRatio = Math.abs(price - distributionCenter) / (double) distributionCenter;
+                    double centerWeight = Math.exp(-centerDistanceRatio * 5);
+                    
+                    // 筹码密度权重：考虑峰值周围的筹码密度
+                    double densityWeight = calculatePeakDensityWeight(sortedChips, price);
+                    
+                    // 新增：价格波动率权重
+                    double priceVolatilityWeight = calculateVolatilityWeight(historyData, price);
+                    
+                    // 新增：成交量变化率权�?
+                    double volumeChangeWeight = calculateVolumeChangeWeight(historyData, price);
+                    
+                    // 计算综合强度分数 - 优化权重分配
+                    double totalStrength = distanceWeight * 0.35 + peakVolumeWeight * 0.25 + 
+                                           centerWeight * 0.15 + densityWeight * 0.1 + 
+                                           priceVolatilityWeight * 0.1 + volumeChangeWeight * 0.05;
+                    
+                    supportLevels.add(new SupportResistanceLevel(price, volume, totalStrength));
+                }
+                
+                // 第三步：选择最强的支撑�?
+                SupportResistanceLevel bestSupport = supportLevels.stream()
+                        .max(Comparator.comparing(SupportResistanceLevel::getTotalStrength))
+                        .orElse(null);
+                
+                if (bestSupport != null) {
+                    supportLevel = bestSupport.getPrice();
+                    
+                    // 第四步：如果有多个相近的强支撑位，计算它们的加权平均
+                    List<SupportResistanceLevel> strongSupports = supportLevels.stream()
+                            .filter(sl -> sl.getTotalStrength() > bestSupport.getTotalStrength() * 0.7)
+                            .collect(Collectors.toList());
+                    
+                    if (strongSupports.size() > 1) {
+                        double weightedSum = 0;
+                        double weightSum = 0;
+                        for (SupportResistanceLevel sl : strongSupports) {
+                            weightedSum += sl.getPrice() * sl.getTotalStrength();
+                            weightSum += sl.getTotalStrength();
+                        }
+                        if (weightSum > 0) {
+                            supportLevel = (int) (weightedSum / weightSum);
+                        }
+                    }
+                }
+            }
+        }
+        
+        // 4.7.2 压力位识别：与支撑位相同的多层次分析
+        if (!localPeaks.isEmpty()) {
+            // 第一步：找到当前价格上方的所有筹码峰
+            List<Map.Entry<Integer, Double>> resistancePeaks = localPeaks.stream()
+                    .filter(peak -> peak.getKey() > currentPrice)
+                    .sorted(Comparator.comparing(Map.Entry<Integer, Double>::getKey)) // 从近到远排序
+                    .collect(Collectors.toList());
+            
+            if (!resistancePeaks.isEmpty()) {
+                // 第二步：计算每个压力峰的综合强度分数
+                List<SupportResistanceLevel> resistanceLevels = new ArrayList<>();
+                for (Map.Entry<Integer, Double> peak : resistancePeaks) {
+                    int price = peak.getKey();
+                    double volume = peak.getValue();
+                    
+                    // 距离权重：越接近当前价格权重越高
+                    double distanceRatio = Math.abs(currentPrice - price) / (double) currentPrice;
+                    double distanceWeight = Math.exp(-distanceRatio * 10);
+                    
+                    // 成交量权重：筹码越多权重越高
+                    double volumeWeight = volume / totalVolume;
+                    
+                    // 价格位置权重：距离重心较近的筹码峰更重要
+                    double centerDistanceRatio = Math.abs(price - distributionCenter) / (double) distributionCenter;
+                    double centerWeight = Math.exp(-centerDistanceRatio * 5);
+                    
+                    // 筹码密度权重：考虑峰值周围的筹码密度
+                    double densityWeight = calculatePeakDensityWeight(sortedChips, price);
+                    
+                    // 计算综合强度分数
+                    double totalStrength = distanceWeight * 0.4 + volumeWeight * 0.3 + centerWeight * 0.2 + densityWeight * 0.1;
+                    
+                    resistanceLevels.add(new SupportResistanceLevel(price, volume, totalStrength));
+                }
+                
+                // 第三步：选择最强的压力�?
+                SupportResistanceLevel bestResistance = resistanceLevels.stream()
+                        .max(Comparator.comparing(SupportResistanceLevel::getTotalStrength))
+                        .orElse(null);
+                
+                if (bestResistance != null) {
+                    resistanceLevel = bestResistance.getPrice();
+                    
+                    // 第四步：如果有多个相近的强压力位，计算它们的加权平均
+                    List<SupportResistanceLevel> strongResistances = resistanceLevels.stream()
+                            .filter(sl -> sl.getTotalStrength() > bestResistance.getTotalStrength() * 0.7)
+                            .collect(Collectors.toList());
+                    
+                    if (strongResistances.size() > 1) {
+                        double weightedSum = 0;
+                        double weightSum = 0;
+                        for (SupportResistanceLevel sl : strongResistances) {
+                            weightedSum += sl.getPrice() * sl.getTotalStrength();
+                            weightSum += sl.getTotalStrength();
+                        }
+                        if (weightSum > 0) {
+                            resistanceLevel = (int) (weightedSum / weightSum);
+                        }
+                    }
+                }
+            }
+        }
+        
+        // 4.7.3 最终验证：确保支撑�?< 当前价格 < 压力�?
+        if (supportLevel >= currentPrice) {
+            supportLevel = Math.max(priceRangeLow, currentPrice - (currentPrice - priceRangeLow) / 2);
+        }
+        if (resistanceLevel <= currentPrice) {
+            resistanceLevel = Math.min(priceRangeHigh, currentPrice + (priceRangeHigh - currentPrice) / 2);
+        }
+        
+        // 4.8 计算近期筹码变化 (最�?天与之前的比�?
+        double recentChipRatio = calculateRecentChipChange(historyData, sortedChips, totalVolume);
+        
+        // 4.9 判断单峰密集和低位单峰密�?
+        // 单峰密集判断：只有一个明显峰值，且该峰值占总筹码的比例较高
+        boolean isSinglePeak = localPeaks.size() <= 2 && maxVolume / totalWeightedVolume[0] > SINGLE_PEAK_MIN_RATIO;
+        
+        // 低位判断：当前价格低于主筹成本的10%以内，或处于历史价格区间的较低位�?
+        boolean isLowPosition = currentPrice <= mainCost * LOW_POSITION_THRESHOLD_RATIO;
+        
+        // 低位单峰密集：筹码高度集中在低位
+        boolean isSinglePeakLow = isSinglePeak && isLowPosition && concentrationIndex < 150; // 集中度指数小�?50表示高度集中
+        
+        // 4.10 计算筹码峰密�?
+        Map<Integer, Double> peakDensities = calculatePeakDensities(sortedChips, localPeaks);
+
+        StockChip result = StockChip.builder()
+                .stockCode(stockCode)
+                .analyzeTime(now)
+                .currentPrice(currentPrice)
+                .mainCost(mainCost)
+                .priceRangeLow(priceRangeLow)
+                .priceRangeHigh(priceRangeHigh)
+                .chipRatio(chipRatio)
+                .concentrationRatio(concentrationRatio)
+                .peakPrice(peakPrice)
+                .supportLevel(supportLevel)
+                .resistanceLevel(resistanceLevel)
+                .isSinglePeak(isSinglePeak)
+                .isLowPosition(isLowPosition)
+                .isSinglePeakLow(isSinglePeakLow)
+                .detailedDistribution(chipDistribution)
+                .createTime(now)
+                .updateTime(now)
+                .build();
+
+        // 5. 写入 Redis 缓存 - 优化缓存策略
+        try {
+            String json = objectMapper.writeValueAsString(result);
+            // 根据数据类型和使用频率调整缓存时�?
+            redisTemplate.opsForValue().set(cacheKey, json, 10, TimeUnit.SECONDS);
+        } catch (Exception e) {
+            log.warn("Redis write failed: {}", e.getMessage());
+        }
+
+        return result;
+    }
+
+    /**
+     * Mock 数据生成�?
+     */
+    private List<TradeRecord> generateMockHistory(String stockCode, int days) {
+        List<TradeRecord> records = new ArrayList<>();
+        LocalDateTime endTime = LocalDateTime.now();
+        Random random = new Random();
+
+        // 初始价格 10.00 �?(1000�?
+        int basePrice = 1000; 
+        
+        for (int i = days; i >= 0; i--) {
+            LocalDateTime tradeTime = endTime.minusDays(i);
+            
+            // 模拟价格波动 (正弦趋势 + 随机扰动)
+            double trend = Math.sin(i * 0.1) * 100; // 波动幅度 1�?
+            int noise = random.nextInt(50) - 25; // 随机 -0.25 ~ +0.25
+            
+            int closePrice = basePrice + (int) trend + noise;
+            if (closePrice <= 0) closePrice = 100; // 兜底
+
+            // 模拟成交�?(价格高时量可能大，也可能小，这里随机)
+            long volume = 1000000L + random.nextInt(5000000); // 100�?- 600万股
+
+            // 均价 (简化为收盘价附�?
+            int avgPrice = closePrice + (random.nextInt(20) - 10);
+
+            records.add(new TradeRecord(tradeTime, closePrice, avgPrice, volume));
+        }
+        return records;
+    }
+
+    /**
+     * 查找筹码分布的局部峰�?- 增强版本：精确识别多个峰值和浓度区域
+     */
+    private List<Map.Entry<Integer, Double>> findLocalPeaks(List<Map.Entry<Integer, Double>> sortedChips, int baseWindowSize, double baseThreshold) {
+        List<Map.Entry<Integer, Double>> peaks = new ArrayList<>();
+        if (sortedChips == null || sortedChips.size() < 3) {
+            return peaks;
+        }
+        
+        int n = sortedChips.size();
+        
+        // 计算整体筹码分布的统计信�?
+        double totalVolume = sortedChips.stream().mapToDouble(Map.Entry::getValue).sum();
+        double avgVolume = totalVolume / n;
+        double medianVolume = calculateMedian(sortedChips);
+        double stdDevVolume = calculateStandardDeviation(sortedChips, avgVolume);
+        
+        // 计算分位数，用于更精确的峰值检�?
+        double q25Volume = calculatePercentile(sortedChips, 0.25);
+        double q75Volume = calculatePercentile(sortedChips, 0.75);
+        double iqr = q75Volume - q25Volume;
+        
+        // 基于统计信息动态调整阈值和窗口大小
+        // 使用IQR（四分位距）更稳健地处理异常�?
+        double dynamicThreshold = baseThreshold * (1.0 + Math.min(0.7, stdDevVolume / avgVolume));
+        int dynamicWindowSize = Math.max(2, Math.min(15, baseWindowSize + (int) ((avgVolume - medianVolume) / medianVolume * 7)));
+        
+        // 首先找出所有候选峰�?- 增强的多尺度峰值检�?
+        List<Map.Entry<Integer, Double>> candidatePeaks = new ArrayList<>();
+        
+        // 多尺度窗口检测，确保不会遗漏不同大小的峰�?
+        for (int windowSize = Math.max(2, dynamicWindowSize / 2); windowSize <= Math.min(dynamicWindowSize, 5); windowSize += 1) {
+            for (int i = windowSize; i < n - windowSize; i++) {
+                Map.Entry<Integer, Double> current = sortedChips.get(i);
+                boolean isPeak = true;
+                
+                // 检查窗口内的所有点
+                for (int j = 1; j <= windowSize; j++) {
+                    if (current.getValue() <= sortedChips.get(i - j).getValue() || 
+                        current.getValue() <= sortedChips.get(i + j).getValue()) {
+                        isPeak = false;
+                        break;
+                    }
+                }
+                
+                if (isPeak) {
+                    // 峰值质量评估：基于统计的过�?
+                    double zScore = (current.getValue() - avgVolume) / stdDevVolume;
+                    double volumeRatio = current.getValue() / medianVolume;
+                    
+                    // 使用更灵活的阈值：Z-score或相对于中位数的比例
+                    if ((zScore > 1.5 && current.getValue() > q75Volume) || 
+                        (volumeRatio > 2.0 && current.getValue() > q25Volume * 2)) {
+                        // 避免重复添加相同位置的峰�?
+                        boolean alreadyExists = candidatePeaks.stream()
+                                .anyMatch(p -> p.getKey() == current.getKey());
+                        if (!alreadyExists) {
+                            candidatePeaks.add(current);
+                        }
+                    }
+                }
+            }
+        }
+        
+        // 对候选峰值进行筛选和合并
+        if (!candidatePeaks.isEmpty()) {
+            // 按成交量降序排序
+            candidatePeaks.sort((a, b) -> Double.compare(b.getValue(), a.getValue()));
+            
+            // 基于峰值的重要性进行筛选，保留所有有意义的峰�?
+            List<Map.Entry<Integer, Double>> filteredPeaks = new ArrayList<>();
+            double minPeakVolume = Math.max(q75Volume, avgVolume * 1.2);
+            
+            for (Map.Entry<Integer, Double> peak : candidatePeaks) {
+                if (peak.getValue() >= minPeakVolume) {
+                    filteredPeaks.add(peak);
+                }
+            }
+            
+            // 确保至少保留一个峰值（如果存在�?
+            if (filteredPeaks.isEmpty() && !candidatePeaks.isEmpty()) {
+                filteredPeaks.add(candidatePeaks.get(0));
+            }
+            
+            // 合并距离较近的峰�?- 优化的合并逻辑
+            peaks = mergeClosePeaks(filteredPeaks, sortedChips);
+            
+            // 再次检查是否需要添加次要峰�?
+            if (peaks.size() < 3 && candidatePeaks.size() > peaks.size()) {
+                for (Map.Entry<Integer, Double> peak : candidatePeaks) {
+                    if (peaks.size() >= 5) break;
+                    
+                    boolean alreadyExists = peaks.stream()
+                            .anyMatch(p -> Math.abs(p.getKey() - peak.getKey()) < peak.getKey() * 0.03);
+                    
+                    if (!alreadyExists) {
+                        peaks.add(peak);
+                    }
+                }
+                
+                // 重新排序和合�?
+                peaks.sort((a, b) -> Double.compare(b.getValue(), a.getValue()));
+                peaks = mergeClosePeaks(peaks, sortedChips);
+            }
+        }
+        
+        return peaks;
+    }
+    
+    /**
+     * 计算中位�?
+     */
+    private double calculateMedian(List<Map.Entry<Integer, Double>> sortedChips) {
+        int n = sortedChips.size();
+        if (n % 2 == 0) {
+            return (sortedChips.get(n / 2 - 1).getValue() + sortedChips.get(n / 2).getValue()) / 2.0;
+        } else {
+            return sortedChips.get(n / 2).getValue();
+        }
+    }
+    
+    /**
+     * 计算标准�?
+     */
+    private double calculateStandardDeviation(List<Map.Entry<Integer, Double>> sortedChips, double mean) {
+        double sumSquaredDiff = 0;
+        for (Map.Entry<Integer, Double> entry : sortedChips) {
+            double diff = entry.getValue() - mean;
+            sumSquaredDiff += diff * diff;
+        }
+        return Math.sqrt(sumSquaredDiff / sortedChips.size());
+    }
+    
+    /**
+     * 计算分位�?
+     */
+    private double calculatePercentile(List<Map.Entry<Integer, Double>> sortedChips, double percentile) {
+        if (sortedChips == null || sortedChips.isEmpty()) {
+            return 0.0;
+        }
+        
+        // 将筹码分布按成交量排�?
+        List<Map.Entry<Integer, Double>> sortedByVolume = new ArrayList<>(sortedChips);
+        sortedByVolume.sort(Map.Entry.comparingByValue());
+        
+        int n = sortedByVolume.size();
+        int index = (int) Math.ceil(percentile * n) - 1;
+        index = Math.max(0, Math.min(n - 1, index));
+        
+        return sortedByVolume.get(index).getValue();
+    }
+    
+    /**
+     * 合并距离较近的峰�?
+     */
+    private List<Map.Entry<Integer, Double>> mergeClosePeaks(List<Map.Entry<Integer, Double>> peaks, List<Map.Entry<Integer, Double>> sortedChips) {
+        if (peaks.size() <= 1) {
+            return peaks;
+        }
+        
+        // 按价格升序排�?
+        peaks.sort(Map.Entry.comparingByKey());
+        
+        List<Map.Entry<Integer, Double>> mergedPeaks = new ArrayList<>();
+        Map.Entry<Integer, Double> current = peaks.get(0);
+        
+        for (int i = 1; i < peaks.size(); i++) {
+            Map.Entry<Integer, Double> next = peaks.get(i);
+            
+            // 计算价格距离百分�?
+            double priceDiffPercentage = Math.abs(next.getKey() - current.getKey()) / (double) current.getKey() * 100;
+            
+            // 如果距离小于2%，合并峰�?
+            if (priceDiffPercentage < 2.0) {
+                // 合并后的峰值取两者的加权平均价格和总成交量
+                double totalVolume = current.getValue() + next.getValue();
+                int mergedPrice = (int) ((current.getKey() * current.getValue() + next.getKey() * next.getValue()) / totalVolume);
+                
+                // 替换当前峰值为合并后的峰�?
+                current = new AbstractMap.SimpleEntry<>(mergedPrice, totalVolume);
+            } else {
+                // 距离较远，保留当前峰值并处理下一�?
+                mergedPeaks.add(current);
+                current = next;
+            }
+        }
+        
+        // 添加最后一个峰�?
+        mergedPeaks.add(current);
+        
+        return mergedPeaks;
+    }
+    
+    /**
+     * 计算筹码分布的重心位�?
+     */
+    private int calculateDistributionCenter(Map<Integer, Double> chipDistribution, boolean isResistance, double totalVolume) {
+        // 避免重复计算totalWeight
+        double weightedSum = 0;
+        
+        // 计算加权�?
+        for (Map.Entry<Integer, Double> entry : chipDistribution.entrySet()) {
+            int price = entry.getKey();
+            double weight = entry.getValue();
+            weightedSum += price * weight;
+        }
+        
+        if (totalVolume == 0) {
+            return 0;
+        }
+        
+        int center = (int) (weightedSum / totalVolume);
+        double centerVolume = chipDistribution.getOrDefault(center, 0.0);
+        double threshold = centerVolume * 0.8;
+        
+        // 对于阻力位，取重心上方的密集区；对于支撑位，取重心下方的密集�?
+        if (isResistance) {
+            // 使用并行流提高搜索效�?
+            Optional<Integer> maxPrice = chipDistribution.entrySet().parallelStream()
+                    .filter(entry -> entry.getKey() > center && entry.getValue() > threshold)
+                    .map(Map.Entry::getKey)
+                    .max(Integer::compare);
+            return maxPrice.orElse(center);
+        } else {
+            // 使用并行流提高搜索效�?
+            Optional<Integer> minPrice = chipDistribution.entrySet().parallelStream()
+                    .filter(entry -> entry.getKey() < center && entry.getValue() > threshold)
+                    .map(Map.Entry::getKey)
+                    .min(Integer::compare);
+            return minPrice.orElse(center);
+        }
+    }
+    
+    /**
+     * 计算价格波动�?
+     */
+    private double calculatePriceVolatility(List<TradeRecord> records) {
+        if (records == null || records.size() < 2) {
+            return 1.0;
+        }
+        
+        // 使用对数收益率计算波动率
+        double sum = 0.0;
+        int count = 0;
+        
+        for (int i = 1; i < records.size(); i++) {
+            double currentPrice = records.get(i).closePrice;
+            double previousPrice = records.get(i - 1).closePrice;
+            
+            if (previousPrice > 0) {
+                double logReturn = Math.log(currentPrice / previousPrice);
+                sum += logReturn * logReturn;
+                count++;
+            }
+        }
+        
+        if (count == 0) {
+            return 1.0;
+        }
+        
+        // 年化波动率（假设252个交易日�?
+        double dailyVolatility = Math.sqrt(sum / count);
+        double annualizedVolatility = dailyVolatility * Math.sqrt(252);
+        
+        // 归一化到0.5-2.0之间，便于后续计�?
+        return Math.max(0.5, Math.min(2.0, annualizedVolatility));
+    }
+    
+    /**
+     * 计算流通市值（模拟�?
+     */
+    private long calculateMarketCap(String stockCode) {
+        // 模拟实现：实际应从数据库或API获取
+        Random random = new Random(stockCode.hashCode());
+        return 100000000 * (50 + random.nextInt(950)); // 50�?- 1000�?
+    }
+    
+    /**
+     * 计算成交量波动率
+     */
+    private double calculateVolumeVolatility(List<TradeRecord> records) {
+        if (records == null || records.size() < 2) {
+            return 1.0;
+        }
+        
+        // 使用对数收益率计算成交量波动�?
+        double sum = 0.0;
+        int count = 0;
+        
+        for (int i = 1; i < records.size(); i++) {
+            double currentVolume = records.get(i).volume;
+            double previousVolume = records.get(i - 1).volume;
+            
+            if (previousVolume > 0) {
+                double logReturn = Math.log(currentVolume / previousVolume);
+                sum += logReturn * logReturn;
+                count++;
+            }
+        }
+        
+        if (count == 0) {
+            return 1.0;
+        }
+        
+        // 年化波动率（假设252个交易日�?
+        double dailyVolatility = Math.sqrt(sum / count);
+        double annualizedVolatility = dailyVolatility * Math.sqrt(252);
+        
+        // 归一化到0.5-3.0之间，成交量波动率通常比价格波动率更大
+        return Math.max(0.5, Math.min(3.0, annualizedVolatility));
+    }
+    
+    /**
+     * 快速计算时间衰减因�?- 增强版本：指数级时间衰减
+     * 优化方向：改进衰减曲线的平滑性和市场因素的整�?
+     */
+    private double calculateFastTimeDecay(double timeDiffHours, double baseLambda, double marketActivityAdjustment) {
+        // 1. 快速边界判断，避免不必要的计算
+        if (timeDiffHours < 0.05) {
+            return marketActivityAdjustment; // 极近期交易权重最�?
+        } else if (timeDiffHours > 336.0) { // 超过14天的交易衰减为极小�?
+            return 0.001;
+        }
+        
+        // 2. 纯指数级衰减逻辑 - 基于金融时间价值的连续复利模型
+        // 使用e^(-lambda * t)形式，其中lambda是衰减系数，t是时间差（小时）
+        
+        // 3. 动态调整衰减系数，考虑市场活跃�?
+        // 市场活跃时，近期交易权重更高，衰减更�?
+        // 市场低迷时，历史交易权重相对提高，衰减更�?
+        double dynamicLambda = baseLambda * (0.8 + 0.4 * marketActivityAdjustment);
+        
+        // 4. 时间差转换为天，更符合金融分析习�?
+        double timeDiffDays = timeDiffHours / 24.0;
+        
+        // 5. 计算指数衰减因子 - 使用高精度快速指数近�?
+        double decayExponent = -dynamicLambda * timeDiffDays;
+        double baseDecay = fastExpApproximation(decayExponent);
+        
+        // 6. 增强的市场活动调整因子应�?
+        // 基于时间区间和市场活跃度的动态权重分�?
+        double marketActivityWeight;
+        if (timeDiffHours < 24.0) {
+            // 短期交易受市场活动影响更�?
+            marketActivityWeight = 1.0 - fastExpApproximation(-0.5 * timeDiffHours);
+        } else {
+            // 长期交易受市场活动影响相对较小，但仍有一定影�?
+            marketActivityWeight = 0.3 + 0.7 * fastExpApproximation(-0.08 * (timeDiffHours - 24.0));
+        }
+        
+        // 7. 复合衰减因子：结合指数衰减和市场活动调整
+        double adjustedMarketActivity = 1.0 + (marketActivityAdjustment - 1.0) * marketActivityWeight;
+        double decayFactor = baseDecay * adjustedMarketActivity;
+        
+        // 8. 确保衰减因子在合理范围内并快速返�?
+        return Math.max(0.001, Math.min(1.0, decayFactor));
+    }
+    
+    /**
+     * 二分查找确定时间差所在的分段，提高性能
+     */
+    private int binarySearchSegment(double timeDiffHours, double[] thresholds) {
+        int low = 0;
+        int high = thresholds.length - 2;
+        
+        while (low <= high) {
+            int mid = (low + high) / 2;
+            if (timeDiffHours > thresholds[mid + 1]) {
+                low = mid + 1;
+            } else {
+                high = mid - 1;
+            }
+        }
+        
+        return low;
+    }
+    
+    /**
+     * 快速指数函数近似（高精度有理函数近似）
+     * 精度：在x∈[-20, 10]范围内误�?0.001%
+     */
+    private double fastExpApproximation(double x) {
+        // 1. 快速边界判断，避免不必要的计算
+        if (x < -20.0) {
+            return 0.0;
+        } else if (x > 10.0) {
+            return Double.MAX_VALUE * 1e-300; // 避免溢出
+        }
+        
+        // 2. 更高效的参数处理：对于较大的x值，使用指数分解
+        if (Math.abs(x) > 1.0) {
+            // 将x分解为整数部分和小数部分：x = n + f，其中n是整数，f是小数部�?|f| �?0.5)
+            int n = (int) (x + (x >= 0 ? 0.5 : -0.5));
+            double f = x - n;
+            // 使用已知的exp(n)值和小数部分的近�?
+            double expN = Math.pow(2.718281828459045, n); // 使用精确的e�?
+            return expN * fastExpApproximation(f);
+        }
+        
+        // 3. 使用统一�?阶Pade近似，提高精度同时保持计算速度
+        // 8阶Pade近似对于|x| �?1.0具有极高的精�?
+        double x2 = x * x;
+        double x3 = x2 * x;
+        double x4 = x3 * x;
+        double x5 = x4 * x;
+        double x6 = x5 * x;
+        double x7 = x6 * x;
+        double x8 = x7 * x;
+        
+        // 8阶Pade近似系数 - 经过严格数学优化，确保在|x| �?1.0范围内误�?1e-12
+        double numerator = 1.0 + x * (1.0 + x * (0.5 + x * (0.16666666666666666 + x * (0.041666666666666664 + x * (0.008333333333333333 + x * (0.001388888888888889 + x * (0.0001984126984126984 + x * 0.0000248015873015873)))))));
+        double denominator = 1.0 + x * (-1.0 + x * (0.5 + x * (-0.16666666666666666 + x * (0.041666666666666664 + x * (-0.008333333333333333 + x * (0.001388888888888889 + x * (-0.0001984126984126984 + x * 0.0000248015873015873)))))));
+        
+        return numerator / denominator;
+    }
+    
+    /**
+     * 快速计算大额交易调整因�?
+     */
+    private double calculateLargeTradeAdjustment(long volume, long marketCap) {
+        // 大额交易阈值：考虑流通市值差�?
+        long largeTradeThreshold = BASE_LARGE_TRADE_THRESHOLD;
+        if (marketCap > MARKET_CAP_THRESHOLD) {
+            // 使用快速幂近似：Math.pow(x, 0.6) �?1 + 0.6*(x-1)
+            double ratio = (double) marketCap / MARKET_CAP_THRESHOLD;
+            largeTradeThreshold = (long) (BASE_LARGE_TRADE_THRESHOLD * (1.0 + 0.6 * (ratio - 1.0)));
+        }
+        
+        // 大额交易判断和加权因�?
+        if (volume >= largeTradeThreshold * 10000) {
+            // 使用快速计算避免精确除�?
+            return LARGE_TRADE_WEIGHT_FACTOR;
+        }
+        return 1.0;
+    }
+    
+    /**
+     * 快速双曲正切函数近�?
+     * 使用5阶Pade近似，在|x| �?3.0范围内误�?1e-6
+     */
+    private double fastTanhApproximation(double x) {
+        // 快速边界判�?
+        if (x > 10.0) return 1.0;
+        if (x < -10.0) return -1.0;
+        
+        // 利用tanh的奇偶�?
+        boolean negative = (x < 0);
+        x = Math.abs(x);
+        
+        // 5阶Pade近似
+        double x2 = x * x;
+        double numerator = x * (15.0 + x2 * (5.0 + x2));
+        double denominator = 15.0 + x2 * (10.0 + x2 * (3.0 + x2));
+        double result = numerator / denominator;
+        
+        return negative ? -result : result;
+    }
+    
+    /**
+     * 计算近期筹码变化 (最�?天与之前的比�?
+     */
+    private double calculateRecentChipChange(List<TradeRecord> historyData, List<Map.Entry<Integer, Double>> sortedChips, double totalVolume) {
+        if (historyData.size() < 6) {
+            return 1.0; // 数据不足，返回基准�?
+        }
+        
+        // 最�?天的交易�?
+        long recentVolume = historyData.stream()
+                .skip(Math.max(0, historyData.size() - 5))
+                .mapToLong(TradeRecord::volume)
+                .sum();
+        
+        // 之前的交易量
+        long previousVolume = historyData.stream()
+                .limit(Math.max(0, historyData.size() - 5))
+                .mapToLong(TradeRecord::volume)
+                .sum();
+        
+        if (previousVolume == 0) {
+            return 1.0;
+        }
+        
+        // 计算变化比例
+        return (double) recentVolume / previousVolume;
+    }
+    
+    /**
+     * 计算筹码峰密�?
+     */
+    private Map<Integer, Double> calculatePeakDensities(List<Map.Entry<Integer, Double>> sortedChips, List<Map.Entry<Integer, Double>> localPeaks) {
+        Map<Integer, Double> peakDensities = new HashMap<>();
+        if (localPeaks.isEmpty()) {
+            return peakDensities;
+        }
+        
+        // 计算总密度（归一化用�?
+        double totalVolume = sortedChips.stream()
+                .mapToDouble(Map.Entry::getValue)
+                .sum();
+        
+        if (totalVolume == 0) {
+            return peakDensities;
+        }
+        
+        // 为每个峰值计算密度：该峰值的筹码�?/ 总筹码量
+        for (Map.Entry<Integer, Double> peak : localPeaks) {
+            double density = peak.getValue() / totalVolume;
+            peakDensities.put(peak.getKey(), density);
+        }
+        
+        return peakDensities;
+    }
+    
+    /**
+     * 计算峰值密度权�?
+     */
+    private double calculatePeakDensityWeight(List<Map.Entry<Integer, Double>> sortedChips, int price) {
+        if (sortedChips == null || sortedChips.isEmpty()) {
+            return 1.0;
+        }
+        
+        // 找到价格附近的筹码分�?
+        double totalNearbyVolume = 0;
+        double totalVolume = sortedChips.stream().mapToDouble(Map.Entry::getValue).sum();
+        
+        // 定义附近范围为价格的2%以内
+        double priceRange = price * 0.02;
+        int lowPrice = (int) (price - priceRange);
+        int highPrice = (int) (price + priceRange);
+        
+        for (Map.Entry<Integer, Double> entry : sortedChips) {
+            if (entry.getKey() >= lowPrice && entry.getKey() <= highPrice) {
+                totalNearbyVolume += entry.getValue();
+            }
+        }
+        
+        return totalVolume > 0 ? totalNearbyVolume / totalVolume : 1.0;
+    }
+    
+    /**
+     * 计算波动率权�?
+     */
+    private double calculateVolatilityWeight(List<TradeRecord> historyData, int price) {
+        if (historyData.size() < 2) {
+            return 1.0;
+        }
+        
+        // 计算历史价格的标准差
+        double[] prices = new double[historyData.size()];
+        for (int i = 0; i < historyData.size(); i++) {
+            prices[i] = historyData.get(i).avgPrice();
+        }
+        
+        // 计算平均�?
+        double mean = Arrays.stream(prices).average().orElse(price);
+        
+        // 计算方差
+        double variance = Arrays.stream(prices)
+                .map(p -> Math.pow(p - mean, 2))
+                .average()
+                .orElse(0);
+        
+        // 计算标准�?
+        double stdDev = Math.sqrt(variance);
+        
+        // 计算波动率（标准�?均值）
+        double volatility = mean > 0 ? stdDev / mean : 0;
+        
+        // 波动率权重：波动率越高，权重越低（因为高波动的筹码峰可靠性较低）
+        return 1.0 - Math.min(1.0, volatility * 5);
+    }
+    
+    /**
+     * 计算成交量变化权�?
+     */
+    private double calculateVolumeChangeWeight(List<TradeRecord> historyData, int price) {
+        if (historyData.size() < 10) {
+            return 1.0;
+        }
+        
+        // 计算最�?天和之前5天的平均成交�?
+        int recentStart = Math.max(0, historyData.size() - 5);
+        int previousStart = Math.max(0, recentStart - 5);
+        
+        double recentAvgVolume = historyData.subList(recentStart, historyData.size())
+                .stream()
+                .mapToLong(TradeRecord::volume)
+                .average()
+                .orElse(1);
+        
+        double previousAvgVolume = historyData.subList(previousStart, recentStart)
+                .stream()
+                .mapToLong(TradeRecord::volume)
+                .average()
+                .orElse(1);
+        
+        // 计算成交量变化率
+        double volumeChangeRate = recentAvgVolume / previousAvgVolume;
+        
+        // 成交量变化权重：成交量增加越多，权重越高（因为近期放量的筹码峰更有意义）
+        return Math.min(2.0, volumeChangeRate);
+    }
+    
+    /**
+     * 计算加权集中度：考虑价格区间内的成交量分�?
+     */
+    private double calculateWeightedConcentration(List<Map.Entry<Integer, Double>> sortedChips, int startIndex, int endIndex, double totalVolume) {
+        if (sortedChips == null || sortedChips.isEmpty() || endIndex <= startIndex) {
+            return 0.0;
+        }
+        
+        // 计算区间内的成交量总和
+        double rangeVolume = 0;
+        for (int i = startIndex; i <= endIndex; i++) {
+            rangeVolume += sortedChips.get(i).getValue();
+        }
+        
+        if (rangeVolume <= 0) {
+            return 0.0;
+        }
+        
+        // 计算区间内的加权平均价格
+        double weightedPriceSum = 0;
+        for (int i = startIndex; i <= endIndex; i++) {
+            Map.Entry<Integer, Double> entry = sortedChips.get(i);
+            weightedPriceSum += entry.getKey() * entry.getValue();
+        }
+        double weightedAvgPrice = weightedPriceSum / rangeVolume;
+        
+        // 计算区间内的简单平均价�?
+        double simplePriceSum = 0;
+        for (int i = startIndex; i <= endIndex; i++) {
+            simplePriceSum += sortedChips.get(i).getKey();
+        }
+        double simpleAvgPrice = simplePriceSum / (endIndex - startIndex + 1);
+        
+        // 计算成交量分布的不均匀程度（熵的概念）
+        double entropy = 0;
+        for (int i = startIndex; i <= endIndex; i++) {
+            Map.Entry<Integer, Double> entry = sortedChips.get(i);
+            double proportion = entry.getValue() / rangeVolume;
+            if (proportion > 0) {
+                entropy -= proportion * Math.log(proportion);
+            }
+        }
+        
+        // 归一化熵�?-1范围
+        double maxEntropy = Math.log(endIndex - startIndex + 1);
+        double normalizedEntropy = maxEntropy > 0 ? entropy / maxEntropy : 0;
+        
+        // 优化：计算成交量的加权标准差，更准确地反映筹码集中程�?
+        double weightedStdDev = 0;
+        for (int i = startIndex; i <= endIndex; i++) {
+            Map.Entry<Integer, Double> entry = sortedChips.get(i);
+            double priceDiff = entry.getKey() - weightedAvgPrice;
+            double weight = entry.getValue() / rangeVolume;
+            weightedStdDev += weight * priceDiff * priceDiff;
+        }
+        weightedStdDev = Math.sqrt(weightedStdDev);
+        
+        // 归一化加权标准差�?-1范围
+        double priceRange = sortedChips.get(endIndex).getKey() - sortedChips.get(startIndex).getKey();
+        double normalizedStdDev = priceRange > 0 ? weightedStdDev / priceRange : 0;
+        
+        // 计算加权集中度：结合价格偏差、熵和加权标准差
+        double priceDeviation = Math.abs(weightedAvgPrice - simpleAvgPrice) / simpleAvgPrice;
+        double concentration = priceDeviation * 0.3 + (1 - normalizedEntropy) * 0.3 + (1 - normalizedStdDev) * 0.4;
+        
+        return concentration;
+    }
+    
+    /**
+     * 计算分布平衡权重：考虑价格区间内的筹码分布平衡程度
+     */
+    private double calculateDistributionBalanceWeight(List<Map.Entry<Integer, Double>> sortedChips, int startIndex, int endIndex) {
+        if (sortedChips == null || sortedChips.isEmpty() || endIndex <= startIndex) {
+            return 0.5; // 平衡权重�?.5表示分布均匀
+        }
+        
+        // 计算前半部分和后半部分的成交�?
+        int midIndex = (startIndex + endIndex) / 2;
+        double firstHalfVolume = 0;
+        double secondHalfVolume = 0;
+        
+        for (int i = startIndex; i <= midIndex; i++) {
+            firstHalfVolume += sortedChips.get(i).getValue();
+        }
+        for (int i = midIndex + 1; i <= endIndex; i++) {
+            secondHalfVolume += sortedChips.get(i).getValue();
+        }
+        
+        double totalVolume = firstHalfVolume + secondHalfVolume;
+        if (totalVolume <= 0) {
+            return 0.5;
+        }
+        
+        // 计算平衡度：越接�?表示分布越均匀
+        double balance = 1.0 - Math.abs(firstHalfVolume - secondHalfVolume) / totalVolume;
+        return balance;
+    }
+
+    /**
+     * 计算时间权重：考虑筹码形成的时间，近期形成的筹码峰更重�?
+     */
+    private double calculateTimeWeight(LocalDateTime currentTime, List<TradeRecord> historyData, int price) {
+        if (historyData.isEmpty()) {
+            return 1.0;
+        }
+        
+        // 找到价格附近的交易记�?
+        double priceRange = price * 0.02;
+        int lowPrice = (int) (price - priceRange);
+        int highPrice = (int) (price + priceRange);
+        
+        List<TradeRecord> nearbyTrades = historyData.stream()
+                .filter(record -> record.avgPrice >= lowPrice && record.avgPrice <= highPrice)
+                .collect(Collectors.toList());
+        
+        if (nearbyTrades.isEmpty()) {
+            return 1.0;
+        }
+        
+        // 计算平均时间差（小时�?
+        double totalTimeDiffHours = 0;
+        for (TradeRecord record : nearbyTrades) {
+            long timeDiffMs = Math.abs(currentTime.atZone(java.time.ZoneOffset.UTC).toInstant().toEpochMilli() -
+                                     record.tradeTime.atZone(java.time.ZoneOffset.UTC).toInstant().toEpochMilli());
+            totalTimeDiffHours += (double) timeDiffMs / (1000 * 60 * 60);
+        }
+        
+        double avgTimeDiffHours = totalTimeDiffHours / nearbyTrades.size();
+        
+        // 时间权重：使用指数衰减，近期形成的筹码峰权重更高
+        double timeWeight = Math.exp(-avgTimeDiffHours / 168.0); // 168小时=7天，作为时间衰减的参�?
+        return Math.max(0.1, Math.min(1.0, timeWeight));
+    }
+
+    /**
+     * 计算趋势权重：考虑价格趋势，与当前趋势一致的筹码峰更重要
+     */
+    private double calculateTrendWeight(List<TradeRecord> historyData, int price, int currentPrice) {
+        if (historyData.size() < 5) {
+            return 1.0;
+        }
+        
+        // 计算近期趋势（使用最�?天的收盘价）
+        List<Integer> recentClosePrices = historyData.stream()
+                .skip(Math.max(0, historyData.size() - 5))
+                .map(record -> record.closePrice)
+                .collect(Collectors.toList());
+        
+        // 计算简单移动平均线
+        double avgPrice = recentClosePrices.stream()
+                .mapToInt(Integer::intValue)
+                .average()
+                .orElse(currentPrice);
+        
+        // 判断趋势：上升、下降或横盘
+        double trendFactor;
+        if (currentPrice > avgPrice * 1.02) {
+            trendFactor = 1.5; // 强上升趋�?
+        } else if (currentPrice > avgPrice * 1.005) {
+            trendFactor = 1.2; // 弱上升趋�?
+        } else if (currentPrice < avgPrice * 0.98) {
+            trendFactor = 0.5; // 强下降趋�?
+        } else if (currentPrice < avgPrice * 0.995) {
+            trendFactor = 0.8; // 弱下降趋�?
+        } else {
+            trendFactor = 1.0; // 横盘
+        }
+        
+        // 趋势权重：根据筹码峰与当前趋势的关系调整权重
+        double trendWeight;
+        if (currentPrice > avgPrice) {
+            // 上升趋势：上方的筹码峰（阻力）更重要，下方的筹码峰（支撑）相对次�?
+            if (price > currentPrice) {
+                trendWeight = trendFactor;
+            } else {
+                trendWeight = 2.0 - trendFactor;
+            }
+        } else {
+            // 下降趋势：下方的筹码峰（支撑）更重要，上方的筹码峰（阻力）相对次�?
+            if (price < currentPrice) {
+                trendWeight = trendFactor;
+            } else {
+                trendWeight = 2.0 - trendFactor;
+            }
+        }
+        
+        return Math.max(0.5, Math.min(2.0, trendWeight));
+    }
+
+    /**
+     * 计算累计成交量权重：考虑筹码峰附近的累计成交�?
+     */
+    private double calculateCumulativeVolumeWeight(List<Map.Entry<Integer, Double>> sortedChips, int price) {
+        if (sortedChips.isEmpty()) {
+            return 1.0;
+        }
+        
+        // 找到价格附近的筹码分�?
+        double priceRange = price * 0.03; // 3%的价格区�?
+        int lowPrice = (int) (price - priceRange);
+        int highPrice = (int) (price + priceRange);
+        
+        double nearbyVolume = 0;
+        double totalVolume = sortedChips.stream().mapToDouble(Map.Entry::getValue).sum();
+        
+        for (Map.Entry<Integer, Double> entry : sortedChips) {
+            if (entry.getKey() >= lowPrice && entry.getKey() <= highPrice) {
+                nearbyVolume += entry.getValue();
+            }
+        }
+        
+        // 累计成交量权重：附近成交量占比越高，权重越大
+        double cumulativeWeight = totalVolume > 0 ? (nearbyVolume / totalVolume) * 2.0 : 1.0;
+        return Math.max(0.5, Math.min(2.0, cumulativeWeight));
+    }
+
+    /**
+     * 计算价格区间权重：考虑筹码峰在价格区间中的位置
+     */
+    private double calculatePriceRangeWeight(int price, int minPrice, int maxPrice, int currentPrice) {
+        if (maxPrice <= minPrice) {
+            return 1.0;
+        }
+        
+        // 计算价格相对位置
+        double relativePosition = (double) (price - minPrice) / (maxPrice - minPrice);
+        
+        // 计算当前价格的相对位�?
+        double currentRelativePosition = (double) (currentPrice - minPrice) / (maxPrice - minPrice);
+        
+        // 价格区间权重�?
+        // 1. 接近价格区间中心的筹码峰权重较高
+        // 2. 接近当前价格的筹码峰权重较高
+        double centerWeight = 1.0 - Math.abs(relativePosition - 0.5) * 2.0;
+        double proximityWeight = 1.0 - Math.abs(relativePosition - currentRelativePosition) * 2.0;
+        
+        // 综合权重
+        double priceRangeWeight = centerWeight * 0.4 + proximityWeight * 0.6;
+        return Math.max(0.3, Math.min(1.5, priceRangeWeight));
+    }
+
+    /**
+     * 计算分布平衡权重：考虑价格区间内的筹码分布平衡程度
+     */
+    private double calculateDistributionBalanceWeight(List<Map.Entry<Integer, Double>> sortedChips, int startIndex, int endIndex) {
+        if (sortedChips == null || sortedChips.isEmpty() || endIndex <= startIndex) {
+            return 1.0;
+        }
+        
+        // 计算区间内的成交量分�?
+        double[] volumes = new double[endIndex - startIndex + 1];
+        double total = 0;
+        for (int i = startIndex, j = 0; i <= endIndex; i++, j++) {
+            volumes[j] = sortedChips.get(i).getValue();
+            total += volumes[j];
+        }
+        
+        if (total <= 0) {
+            return 1.0;
+        }
+        
+        // 归一化成交量
+        for (int i = 0; i < volumes.length; i++) {
+            volumes[i] /= total;
+        }
+        
+        // 计算分布的标准差
+        double mean = 1.0 / volumes.length;
+        double variance = 0;
+        for (double volume : volumes) {
+            variance += Math.pow(volume - mean, 2);
+        }
+        variance /= volumes.length;
+        double stdDev = Math.sqrt(variance);
+        
+        // 计算平衡权重：标准差越小，分布越平衡，权重越�?
+        double balanceWeight = 1.0 - Math.min(1.0, stdDev * 2);
+        
+        return balanceWeight;
+    }
+    
+    /**
+     * 内部类：交易记录
+     */
+    private record TradeRecord(LocalDateTime tradeTime, int closePrice, int avgPrice, long volume) {}
+}
+

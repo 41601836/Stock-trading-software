@@ -19,10 +19,17 @@
     </properties>
 
     <dependencies>
-        <!-- Web Starter -->
+        <!-- Spring Boot Web -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+        
+        <!-- Lombok -->
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <optional>true</optional>
         </dependency>
 
         <!-- Validation -->
@@ -55,6 +62,13 @@
         <dependency>
             <groupId>com.mysql</groupId>
             <artifactId>mysql-connector-j</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+        
+        <!-- H2数据库 -->
+        <dependency>
+            <groupId>com.h2database</groupId>
+            <artifactId>h2</artifactId>
             <scope>runtime</scope>
         </dependency>
         
@@ -115,6 +129,12 @@
             <artifactId>ta4j-core</artifactId>
             <version>0.15</version>
         </dependency>
+        <!-- TA-Lib 原生库包装器 -->
+        <dependency>
+            <groupId>com.tictactec</groupId>
+            <artifactId>ta-lib</artifactId>
+            <version>0.4.0</version>
+        </dependency>
         
         <!-- Flink 流处理框架 -->
         <dependency>
@@ -137,17 +157,26 @@
             <artifactId>flink-connector-kafka</artifactId>
             <version>1.17.0</version>
         </dependency>
+        <!-- Flink Table API -->
         <dependency>
             <groupId>org.apache.flink</groupId>
-            <artifactId>flink-connector-redis</artifactId>
-            <version>1.1.5</version>
-        </dependency>
-        <!-- Flink 与 Spring Boot 集成 -->
-        <dependency>
-            <groupId>org.apache.flink</groupId>
-            <artifactId>flink-spring-boot-starter</artifactId>
+            <artifactId>flink-table-api-java-bridge</artifactId>
             <version>1.17.0</version>
         </dependency>
+        <!-- Flink Table Planner -->
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-table-planner-loader</artifactId>
+            <version>1.17.0</version>
+        </dependency>
+        <!-- Flink Table Runtime -->
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-table-runtime</artifactId>
+            <version>1.17.0</version>
+        </dependency>
+        
+        
     </dependencies>
 
     <build>
@@ -155,14 +184,6 @@
             <plugin>
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
-                <configuration>
-                    <excludes>
-                        <exclude>
-                            <groupId>org.projectlombok</groupId>
-                            <artifactId>lombok</artifactId>
-                        </exclude>
-                    </excludes>
-                </configuration>
             </plugin>
         </plugins>
     </build>

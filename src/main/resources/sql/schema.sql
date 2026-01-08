@@ -31,7 +31,7 @@ CREATE TABLE IF NOT EXISTS `t_large_order` (
     `order_type` VARCHAR(32) NOT NULL COMMENT '异动类型: ROCKET_LAUNCH(直线拉升), LARGE_BUY(大单买入)等',
     `create_time` DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
     PRIMARY KEY (`id`),
-    INDEX `idx_stock_time` (`stock_code`, `trade_time`)
+    INDEX `idx_large_order_stock_time` (`stock_code`, `trade_time`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='大单异动记录表';
 
 -- ----------------------------

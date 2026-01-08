@@ -4,6 +4,73 @@ server:
 spring:
   application:
     name: stock-analysis
+  profiles:
+    active: h2  # 默认使用H2数据库
+  # Redis配置 (所有环境共用)
+  data:
+    redis:
+      host: localhost
+      port: 6379
+      database: 0
+      timeout: 5000ms
+      lettuce:
+        pool:
+          max-active: 8
+          max-wait: 1000ms
+          max-idle: 8
+          min-idle: 0
+        shutdown-timeout: 1000ms
+      connect-timeout: 5000ms
+    
+---
+# H2数据库配置 (默认)
+spring:
+  config:
+    activate:
+      on-profile: h2
+  # 数据库配置
+  datasource:
+    url: jdbc:h2:file:./data/stock_analysis;MODE=MYSQL;DB_CLOSE_ON_EXIT=FALSE;AUTO_RECONNECT=TRUE
+    username: sa
+    password: 
+    driver-class-name: org.h2.Driver
+    # HikariCP连接池配置
+    hikari:
+      minimum-idle: 5
+      maximum-pool-size: 20
+      connection-timeout: 30000
+      idle-timeout: 600000
+      max-lifetime: 1800000
+      validation-timeout: 5000
+      leak-detection-threshold: 60000
+      connection-test-query: SELECT 1
+  # JPA配置
+  jpa:
+    hibernate:
+      ddl-auto: none
+    show-sql: true
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.H2Dialect
+  # H2控制台配置
+  h2:
+    console:
+      enabled: true
+      path: /h2-console
+      settings:
+        web-allow-others: false
+  # 初始化数据库
+  sql:
+    init:
+      mode: always
+      schema-locations: classpath:sql/schema_h2.sql
+
+---
+# MySQL数据库配置
+spring:
+  config:
+    activate:
+      on-profile: mysql
   # 数据库配置
   datasource:
     url: jdbc:mysql://localhost:3306/stock_analysis?useUnicode=true&characterEncoding=utf-8&useSSL=false&serverTimezone=Asia/Shanghai&rewriteBatchedStatements=true
@@ -28,21 +95,11 @@ spring:
     properties:
       hibernate:
         dialect: org.hibernate.dialect.MySQLDialect
-  # Redis配置
-  data:
-    redis:
-      host: localhost
-      port: 6379
-      database: 0
-      timeout: 5000ms
-      lettuce:
-        pool:
-          max-active: 8
-          max-wait: 1000ms
-          max-idle: 8
-          min-idle: 0
-        shutdown-timeout: 1000ms
-      connect-timeout: 5000ms
+  # 初始化数据库
+  sql:
+    init:
+      mode: always
+      schema-locations: classpath:sql/schema.sql
 
 logging:
   pattern:
